@@ -8,6 +8,14 @@ const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+// Client ID del flujo de "dispositivo" (Device Authorization Grant) que usa
+// el propio juego (google_auth.gd, tipo "TV and Limited Input devices" en
+// Google Cloud Console). Es un Client ID DISTINTO del de arriba (ese es el
+// de tipo "Web" que usa el flujo por navegador de /auth/google). Ambos son
+// válidos como "aud" en los id_token que llegan a /auth/google/device.
+const GOOGLE_DEVICE_CLIENT_ID =
+  process.env.GOOGLE_DEVICE_CLIENT_ID ||
+  '702925837605-gdvk62fp2r26umpeomg285q1o0ntbd8d.apps.googleusercontent.com';
 // URL pública de ESTE servidor (la de Railway), para construir la redirect_uri
 // que le decimos a Google. Debe coincidir EXACTAMENTE con la que registres en
 // Google Cloud Console como "Authorized redirect URI".
@@ -131,6 +139,61 @@ router.get('/google/callback', async (req, res) => {
   } catch (err) {
     console.error('Error en /auth/google/callback:', err);
     return res.redirect(`${redirectUri}?error=server_error`);
+  }
+});
+
+// POST /auth/google/device   body: { id_token }
+// Puente para el login "sin navegador" del propio juego (Device
+// Authorization Grant, ver google_auth.gd): el cliente ya obtuvo un
+// id_token directamente de Google (oauth2.googleapis.com/token) y aquí lo
+// intercambiamos por un token de SESIÓN de este backend (el mismo tipo que
+// emite /auth/google/callback para el flujo web). A partir de ahí el
+// cliente sigue el mismo camino que un login por navegador:
+//   GET  /api/session/validate  -> ¿esta cuenta ya tiene licencia?
+//   POST /api/redeem            -> vincular una key nueva si no la tiene
+//
+// El id_token se valida contra el propio endpoint de Google (tokeninfo),
+// que comprueba la firma y la caducidad por nosotros; solo añadimos la
+// comprobación de que el "aud" sea uno de nuestros Client IDs conocidos,
+// para que nadie pueda colarnos un id_token emitido para OTRA aplicación.
+router.post('/google/device', async (req, res) => {
+  const idToken = req.body?.id_token;
+  if (!idToken) {
+    return res.status(400).json({ ok: false, error: 'Falta id_token.' });
+  }
+
+  try {
+    const infoRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`
+    );
+    const claims = await infoRes.json();
+
+    if (!infoRes.ok || !claims.sub) {
+      return res.status(401).json({ ok: false, error: 'id_token inválido o caducado.' });
+    }
+
+    const validAudiences = [GOOGLE_CLIENT_ID, GOOGLE_DEVICE_CLIENT_ID].filter(Boolean);
+    if (!validAudiences.includes(claims.aud)) {
+      return res.status(401).json({ ok: false, error: 'id_token no emitido para esta app.' });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO users (google_id, email, name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (google_id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name
+       RETURNING id, email, name`,
+      [claims.sub, claims.email || null, claims.name || null]
+    );
+    const user = rows[0];
+
+    const sessionToken = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, {
+      expiresIn: '30d',
+    });
+
+    return res.json({ ok: true, token: sessionToken, user: { email: user.email, name: user.name } });
+  } catch (err) {
+    console.error('Error en /auth/google/device:', err);
+    return res.status(500).json({ ok: false, error: 'Error del servidor al verificar el login de Google.' });
   }
 });
 
