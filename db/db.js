@@ -296,57 +296,26 @@ if (!guildMembersColumns.includes('role')) {
 }
 
 // Migración: marca de "ya se hizo la sincronización única" de /api/player/sync.
-// ANTES esto se confiaba por completo al cliente ("el juego no lo vuelve a
-// llamar"), lo que permitía a cualquiera con el token JWT (visible en el
-// propio cliente) llamar a /sync las veces que quisiera y meterse hasta
-// 10.000.000 de monedas/nivel/elo de golpe. Con esta columna el servidor
-// rechaza cualquier sync posterior a la primera vez, sea cual sea el
-// dispositivo o cuántas veces lo reintente el cliente.
 if (!playerStatsColumns.includes('synced_at')) {
   db.exec("ALTER TABLE player_stats ADD COLUMN synced_at TEXT");
   console.log('Migración aplicada: columna synced_at añadida a player_stats');
 }
 
 // Migración: monedas de entrenamiento server-authoritative.
-// ANTES "training_coins" solo existía en el cliente (PlayerData.training_coins,
-// nunca sincronizada), y /api/guild/donate con source:"training" confiaba
-// ciegamente en que el cliente ya las había descontado, sin validar ni
-// descontar nada server-side. Cualquiera podía spamear ese endpoint para
-// inflar chest_progress/nivel/xp del clan sin gastar nada real, y luego
-// /api/guild/chest/open repartía monedas reales a todo el clan. Con esta
-// columna el servidor lleva su propio saldo de monedas de entrenamiento
-// (ver POST /api/player/training-coins-earned) y /donate lo valida y
-// descuenta igual que hace con "coins".
 if (!playerStatsColumns.includes('training_coins')) {
   db.exec("ALTER TABLE player_stats ADD COLUMN training_coins INTEGER NOT NULL DEFAULT 0");
   console.log('Migración aplicada: columna training_coins añadida a player_stats');
 }
 
-// Migración: columna grace_until en premium_orders. Antes, un pedido pasaba
-// a "expired" en seco en cuanto vencía expires_at, y a partir de ahí nadie
-// volvía a comprobar su reference en la blockchain. Si el pago se confirmaba
-// unos segundos tarde (red congestionada, wallet lenta, RPC saturado), el
-// jugador pagaba SOL de verdad y no recibía monedas, sin ninguna forma de
-// recuperarlo. Con grace_until, el pedido sigue vigilado por el watcher
-// GRACE_PERIOD_MINUTES más allá de expires_at antes de darlo por perdido de
-// verdad (ver lib/shopWatcher.js y routes/shop.js).
+// Migración: columna grace_until en premium_orders.
 const premiumOrdersColumns = db.prepare("PRAGMA table_info(premium_orders)").all().map((c) => c.name);
 if (!premiumOrdersColumns.includes('grace_until')) {
   db.exec('ALTER TABLE premium_orders ADD COLUMN grace_until TEXT');
-  // Pedidos ya existentes (de antes de esta migración): les damos el mismo
-  // grace_until que su expires_at, sin margen extra, para no reabrir de
-  // golpe la ventana de comprobación de pedidos ya antiguos.
   db.exec('UPDATE premium_orders SET grace_until = expires_at WHERE grace_until IS NULL');
   console.log('Migración aplicada: columna grace_until añadida a premium_orders');
 }
 
 // --- Fase 5a: Casas de Jugadores, Zona de Mascotas y Tienda de Gestos ---
-// Las tres funcionalidades identifican al jugador por license_id, igual que
-// el resto de tablas de este archivo (no hay una tabla "players" separada:
-// la licencia ES el jugador). Se crean aquí, junto al resto del esquema, en
-// vez de en un fichero de migración aparte, porque este proyecto no usa
-// migrate.js: todo el esquema vive en este db.exec() que se ejecuta al
-// arrancar el servidor.
 db.exec(`
 CREATE TABLE IF NOT EXISTS player_houses (
   license_id INTEGER PRIMARY KEY REFERENCES licenses(id),
@@ -388,7 +357,7 @@ CREATE TABLE IF NOT EXISTS player_gesture_slots (
 );
 `);
 
-// --- Fase 2+4: world_state, anticheat_flags ---
+// --- Fase 2+4: world_state, anticheat_flags, shop_packages ---
 db.exec(`
 CREATE TABLE IF NOT EXISTS world_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),  -- fila única
@@ -399,6 +368,27 @@ CREATE TABLE IF NOT EXISTS world_state (
 );
 -- Garantiza que siempre exista la fila única
 INSERT OR IGNORE INTO world_state (id) VALUES (1);
+
+-- Paquetes de monedas de la tienda premium. Editables desde el panel de
+-- admin (PUT /api/admin/shop/packages/:id) sin necesidad de desplegar.
+CREATE TABLE IF NOT EXISTS shop_packages (
+  id TEXT PRIMARY KEY,
+  coins INTEGER NOT NULL,
+  price_usd REAL NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- Semilla inicial; solo inserta si la tabla está vacía para no pisar
+-- cambios que ya se hayan hecho desde el admin.
+INSERT INTO shop_packages (id, coins, price_usd, sort_order)
+SELECT * FROM (VALUES
+  ('p500',   500,   1.99, 1),
+  ('p1200',  1200,  3.99, 2),
+  ('p2800',  2800,  7.99, 3),
+  ('p6000',  6000,  14.99, 4),
+  ('p12000', 12000, 24.99, 5)
+)
+WHERE NOT EXISTS (SELECT 1 FROM shop_packages);
 
 CREATE TABLE IF NOT EXISTS anticheat_flags (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
