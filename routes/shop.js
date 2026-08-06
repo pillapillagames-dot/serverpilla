@@ -10,16 +10,12 @@ const { MERCHANT_WALLET } = require('../lib/solana');
 
 const router = express.Router();
 
-// Paquetes de monedas premium. El precio real en USD manda aquí; el cliente
-// solo los pinta. Coinciden con el diseño de la tienda (ver imagen de
-// referencia): 500/1200/2800/6000/12000 monedas.
-const COIN_PACKAGES = [
-  { id: 'p500', coins: 500, priceUsd: 1.99 },
-  { id: 'p1200', coins: 1200, priceUsd: 3.99 },
-  { id: 'p2800', coins: 2800, priceUsd: 7.99 },
-  { id: 'p6000', coins: 6000, priceUsd: 14.99 },
-  { id: 'p12000', coins: 12000, priceUsd: 24.99 },
-];
+// Paquetes de monedas premium. Viven en la tabla shop_packages (editable
+// desde el admin) en vez de hardcodeados, para poder cambiar monedas y
+// precio sin desplegar.
+function getCoinPackages() {
+  return db.prepare('SELECT id, coins, price_usd AS priceUsd FROM shop_packages ORDER BY sort_order ASC, id ASC').all();
+}
 
 // Un pedido caduca a los 20 minutos si no se paga: pasado ese tiempo el
 // watcher deja de vigilarlo y el cliente debe pedir uno nuevo (el precio en
@@ -27,7 +23,7 @@ const COIN_PACKAGES = [
 const ORDER_TTL_MINUTES = 20;
 
 function findPackage(packageId) {
-  return COIN_PACKAGES.find((p) => p.id === packageId);
+  return getCoinPackages().find((p) => p.id === packageId);
 }
 
 // GET /api/shop/packages  (público, sin token: se puede pintar la tienda
@@ -35,7 +31,7 @@ function findPackage(packageId) {
 router.get('/packages', async (req, res) => {
   try {
     const solPriceUsd = await getSolPrice();
-    const packages = COIN_PACKAGES.map((p) => ({
+    const packages = getCoinPackages().map((p) => ({
       ...p,
       priceSol: Number((p.priceUsd / solPriceUsd).toFixed(6)),
     }));
