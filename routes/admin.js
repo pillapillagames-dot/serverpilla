@@ -16,17 +16,8 @@ const {
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
-// Fase 5: autenticación real con JWT + roles. La x-admin-key vieja sigue
-// funcionando como puente (ver lib/adminAuth.js) hasta que todo el mundo
-// tenga cuenta propia.
-// ---------------------------------------------------------------------------
-router.use(requireAdminSession);
-
-// ---------------------------------------------------------------------------
-// POST /api/admin/auth/login
+// POST /api/admin/auth/login  — PÚBLICO, antes del middleware de auth
 // body: { username, password }
-// Devuelve un JWT de sesión (12h). El HTML lo guarda en memoria y lo manda
-// en Authorization: Bearer <token> en cada petición posterior.
 // ---------------------------------------------------------------------------
 router.post('/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
@@ -53,6 +44,11 @@ router.post('/auth/login', async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Todo lo que sigue requiere sesión válida (JWT o x-admin-key puente)
+// ---------------------------------------------------------------------------
+router.use(requireAdminSession);
 
 // ---------------------------------------------------------------------------
 // POST /api/admin/auth/create-user   (solo owner)
