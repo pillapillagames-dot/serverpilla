@@ -637,4 +637,80 @@ router.get('/shop/orders', (req, res) => {
   res.json({ ok: true, orders: rows, totals });
 });
 
+// ---------------------------------------------------------------------------
+// Logs de errores
+// GET  /api/admin/error-logs?level=&resolved=&context=&limit=150
+// POST /api/admin/error-logs/:id/resolve
+// POST /api/admin/error-logs/:id/reopen
+// DELETE /api/admin/error-logs/:id
+// POST /api/admin/error-logs/clear-resolved
+// ---------------------------------------------------------------------------
+router.get('/error-logs', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 150, 500);
+  const conditions = [];
+  const params = [];
+
+  if (req.query.level) {
+    conditions.push('el.level = ?');
+    params.push(req.query.level);
+  }
+  if (req.query.resolved !== undefined && req.query.resolved !== '') {
+    conditions.push('el.resolved = ?');
+    params.push(req.query.resolved === 'true' || req.query.resolved === '1' ? 1 : 0);
+  }
+  if (req.query.context) {
+    conditions.push('el.context LIKE ?');
+    params.push(`%${req.query.context}%`);
+  }
+
+  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const logs = db.prepare(
+    `SELECT el.id, el.level, el.message, el.stack, el.context,
+            el.app_version, el.platform, el.resolved, el.created_at,
+            l.key_prefix, l.customer_email,
+            ps.username
+     FROM error_logs el
+     LEFT JOIN licenses l ON l.id = el.license_id
+     LEFT JOIN player_stats ps ON ps.license_id = el.license_id
+     ${where}
+     ORDER BY el.id DESC
+     LIMIT ?`
+  ).all(...params, limit);
+
+  const totals = db.prepare(
+    `SELECT COUNT(*) AS total,
+            COUNT(CASE WHEN resolved = 0 THEN 1 END) AS unresolved,
+            COUNT(CASE WHEN level = 'fatal' THEN 1 END) AS fatalCount
+     FROM error_logs`
+  ).get();
+
+  res.json({ ok: true, logs, totals });
+});
+
+router.post('/error-logs/clear-resolved', (req, res) => {
+  const info = db.prepare('DELETE FROM error_logs WHERE resolved = 1').run();
+  logAudit(req, 'error-logs.clear-resolved', null, { deleted: info.changes }).catch(console.error);
+  res.json({ ok: true, deleted: info.changes });
+});
+
+router.post('/error-logs/:id/resolve', (req, res) => {
+  const info = db.prepare('UPDATE error_logs SET resolved = 1 WHERE id = ?').run(req.params.id);
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Log no encontrado.' });
+  res.json({ ok: true });
+});
+
+router.post('/error-logs/:id/reopen', (req, res) => {
+  const info = db.prepare('UPDATE error_logs SET resolved = 0 WHERE id = ?').run(req.params.id);
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Log no encontrado.' });
+  res.json({ ok: true });
+});
+
+router.delete('/error-logs/:id', (req, res) => {
+  const info = db.prepare('DELETE FROM error_logs WHERE id = ?').run(req.params.id);
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Log no encontrado.' });
+  logAudit(req, 'error-logs.delete', `error_logs:${req.params.id}`).catch(console.error);
+  res.json({ ok: true });
+});
+
 module.exports = router;
