@@ -18,6 +18,7 @@ const battleRoutes = require('./routes/battle');
 const houseRoutes = require('./routes/house');
 const petRoutes = require('./routes/pets');
 const gestureRoutes = require('./routes/gestures');
+const errorRoutes = require('./routes/errors');
 const app = express();
 
 // --- CORS: permite que páginas web (tienda, launcher web, etc.) llamen
@@ -51,6 +52,7 @@ app.use('/api/battle', battleRoutes);
 app.use('/api/player/house', houseRoutes);
 app.use('/api/player/pets', petRoutes);
 app.use('/api/player/gestures', gestureRoutes);
+app.use('/api/errors', errorRoutes);
 
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'pilla-pilla-server' });
