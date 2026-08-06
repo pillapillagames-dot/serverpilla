@@ -283,6 +283,9 @@ router.post('/match-result', requireToken, (req, res) => {
   const now = Date.now();
   const lastAt = _lastMatchResultAt.get(req.license.id) || 0;
   if (now - lastAt < MATCH_RESULT_COOLDOWN_MS) {
+    try {
+      db.prepare(`INSERT INTO anticheat_flags (license_id, reason) VALUES (?, 'cooldown')`).run(req.license.id);
+    } catch (_) { /* no bloquear la respuesta si falla el registro */ }
     return res.status(429).json({ ok: false, error: 'Estás mandando resultados de partida demasiado rápido.' });
   }
 
@@ -309,6 +312,9 @@ router.post('/match-result', requireToken, (req, res) => {
   for (const [key, value] of Object.entries(nums)) {
     const { min, max } = MATCH_LIMITS[key];
     if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
+      try {
+        db.prepare(`INSERT INTO anticheat_flags (license_id, reason, field) VALUES (?, 'value_out_of_range', ?)`).run(req.license.id, key);
+      } catch (_) { /* no bloquear */ }
       return res.status(400).json({ ok: false, error: `Valor inválido: ${key}` });
     }
   }
@@ -316,6 +322,9 @@ router.post('/match-result', requireToken, (req, res) => {
   // razonable por partida para que un cliente manipulado no pueda inflarse
   // el rating de golpe.
   if (typeof eloDelta !== 'number' || !Number.isFinite(eloDelta) || eloDelta < -200 || eloDelta > 200) {
+    try {
+      db.prepare(`INSERT INTO anticheat_flags (license_id, reason, field) VALUES (?, 'value_out_of_range', 'eloDelta')`).run(req.license.id);
+    } catch (_) { /* no bloquear */ }
     return res.status(400).json({ ok: false, error: 'Valor inválido: eloDelta' });
   }
   // El puesto solo tiene sentido entre -1 (no torneo) y un puñado de
