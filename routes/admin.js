@@ -4,26 +4,102 @@ const db = require('../db/db');
 const { pool } = require('../db/pg');
 const { generateKey, hashKey, prefixOf } = require('../db/keys');
 const { listOnline } = require('../lib/onlineTracker');
+const {
+  requireAdminSession,
+  requireRole,
+  logAudit,
+  hashPassword,
+  verifyPassword,
+  signAdminToken,
+} = require('../lib/adminAuth');
 
 const router = express.Router();
 
 // ---------------------------------------------------------------------------
-// Auth: clave compartida (Fase 1-4). Fase 5 la reemplazará por adminAuth.js.
+// Fase 5: autenticación real con JWT + roles. La x-admin-key vieja sigue
+// funcionando como puente (ver lib/adminAuth.js) hasta que todo el mundo
+// tenga cuenta propia.
 // ---------------------------------------------------------------------------
-function requireAdmin(req, res, next) {
-  const key = req.headers['x-admin-key'];
-  const expected = Buffer.from(String(process.env.ADMIN_KEY || ''));
-  const given = Buffer.from(String(key || ''));
-  if (
-    !key ||
-    given.length !== expected.length ||
-    !crypto.timingSafeEqual(given, expected)
-  ) {
-    return res.status(401).json({ ok: false, error: 'No autorizado.' });
+router.use(requireAdminSession);
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/auth/login
+// body: { username, password }
+// Devuelve un JWT de sesión (12h). El HTML lo guarda en memoria y lo manda
+// en Authorization: Bearer <token> en cada petición posterior.
+// ---------------------------------------------------------------------------
+router.post('/auth/login', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ ok: false, error: 'Faltan username o password.' });
   }
-  next();
-}
-router.use(requireAdmin);
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, username, password_hash, role, active FROM admin_users WHERE username = $1',
+      [username]
+    );
+    const user = rows[0];
+    if (!user || !user.active) {
+      return res.status(401).json({ ok: false, error: 'Usuario o contraseña incorrectos.' });
+    }
+    const ok = await verifyPassword(password, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ ok: false, error: 'Usuario o contraseña incorrectos.' });
+    }
+    await pool.query('UPDATE admin_users SET last_login_at = now() WHERE id = $1', [user.id]);
+    const token = signAdminToken(user);
+    res.json({ ok: true, token, username: user.username, role: user.role });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/auth/create-user   (solo owner)
+// body: { username, password, role }
+// Crea una cuenta admin nueva. Solo el owner puede hacerlo.
+// ---------------------------------------------------------------------------
+router.post('/auth/create-user', requireRole('owner'), async (req, res) => {
+  const { username, password, role = 'support' } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ ok: false, error: 'Faltan username o password.' });
+  }
+  if (!['owner', 'support'].includes(role)) {
+    return res.status(400).json({ ok: false, error: 'Rol inválido. Usa owner o support.' });
+  }
+  try {
+    const hash = await hashPassword(password);
+    const { rows } = await pool.query(
+      'INSERT INTO admin_users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING id, username, role',
+      [username, hash, role]
+    );
+    logAudit(req, 'auth.create-user', `admin_users:${rows[0].id}`, { username, role }).catch(console.error);
+    res.json({ ok: true, user: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ ok: false, error: 'Ese username ya existe.' });
+    }
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/admin/auth/audit-log?limit=200
+// Historial de acciones de administradores. Solo owner.
+// ---------------------------------------------------------------------------
+router.get('/auth/audit-log', requireRole('owner'), async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, admin_username, action, target, details, created_at
+       FROM admin_audit_log ORDER BY created_at DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ ok: true, entries: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Skin names — deben coincidir con player_data.gd en el cliente
@@ -56,6 +132,7 @@ router.post('/keys/generate', (req, res) => {
   });
   tx();
 
+  logAudit(req, 'keys.generate', null, { count, notes, customerEmail }).catch(console.error);
   res.json({ ok: true, keys: generated });
 });
 
@@ -81,6 +158,7 @@ router.post('/keys/:id/revoke', (req, res) => {
     .prepare(`UPDATE licenses SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?`)
     .run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Key no encontrada.' });
+  logAudit(req, 'keys.revoke', `licenses:${req.params.id}`).catch(console.error);
   res.json({ ok: true });
 });
 
@@ -88,6 +166,7 @@ router.post('/keys/:id/revoke', (req, res) => {
 router.post('/keys/:id/reset-device', (req, res) => {
   const info = db.prepare('UPDATE licenses SET device_id = NULL WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Key no encontrada.' });
+  logAudit(req, 'keys.reset-device', `licenses:${req.params.id}`).catch(console.error);
   res.json({ ok: true });
 });
 
@@ -184,6 +263,7 @@ router.post('/news', (req, res) => {
     ? db.prepare('INSERT INTO news (title, body, date) VALUES (?, ?, ?)')
     : db.prepare('INSERT INTO news (title, body) VALUES (?, ?)');
   const info = date ? stmt.run(title, newsBody, date) : stmt.run(title, newsBody);
+  logAudit(req, 'news.create', `news:${info.lastInsertRowid}`, { title }).catch(console.error);
   res.json({ ok: true, id: info.lastInsertRowid });
 });
 
@@ -195,6 +275,7 @@ router.get('/news', (req, res) => {
 router.delete('/news/:id', (req, res) => {
   const info = db.prepare('DELETE FROM news WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Novedad no encontrada.' });
+  logAudit(req, 'news.delete', `news:${req.params.id}`).catch(console.error);
   res.json({ ok: true });
 });
 
@@ -258,6 +339,7 @@ router.post('/game-keys/:id/unlink', async (req, res) => {
       [req.params.id]
     );
     if (rowCount === 0) return res.status(404).json({ ok: false, error: 'Key no encontrada.' });
+    logAudit(req, 'game-keys.unlink', `game_keys:${req.params.id}`).catch(console.error);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -270,6 +352,7 @@ router.post('/game-keys/:id/revoke', async (req, res) => {
       req.params.id,
     ]);
     if (rowCount === 0) return res.status(404).json({ ok: false, error: 'Key no encontrada.' });
+    logAudit(req, 'game-keys.revoke', `game_keys:${req.params.id}`).catch(console.error);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -329,6 +412,7 @@ router.post('/players/:id/coins', (req, res) => {
     .run(coins, licenseId);
 
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
+  logAudit(req, 'players.set-coins', `licenses:${licenseId}`, { coins }).catch(console.error);
   res.json({ ok: true, coins });
 });
 
@@ -410,6 +494,7 @@ router.post('/players/:id/skins', (req, res) => {
     `UPDATE player_stats SET unlocked_skins = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(JSON.stringify(unlocked), licenseId);
 
+  logAudit(req, 'players.set-skin', `licenses:${licenseId}`, { skinIndex, owned }).catch(console.error);
   res.json({ ok: true, unlockedSkins: unlocked });
 });
 
@@ -495,6 +580,7 @@ router.post('/world', (req, res) => {
   ).run(maintenanceMode, maintenanceMessage, bannerMessage);
 
   const world = db.prepare('SELECT * FROM world_state WHERE id = 1').get();
+  logAudit(req, 'world.update', 'world_state:1', { maintenanceMode: !!maintenanceMode, bannerMessage }).catch(console.error);
   res.json({ ok: true, world });
 });
 
