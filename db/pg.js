@@ -58,13 +58,4 @@ async function ensureSchema() {
   `);
 }
 
-// Llamamos aquí para no tener que tocar server.js. adminAuth.js importa
-// pool desde este mismo archivo, así que no hay dependencia circular.
-const { ensureAdminAuthSchema } = require('../lib/adminAuth');
-
-async function ensureAllSchemas() {
-  await ensureSchema();
-  await ensureAdminAuthSchema();
-}
-
-module.exports = { pool, ensureSchema: ensureAllSchemas };
+module.exports = { pool, ensureSchema };
