@@ -388,4 +388,26 @@ CREATE TABLE IF NOT EXISTS player_gesture_slots (
 );
 `);
 
+// --- Fase 2+4: world_state, anticheat_flags ---
+db.exec(`
+CREATE TABLE IF NOT EXISTS world_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),  -- fila única
+  maintenance_mode INTEGER NOT NULL DEFAULT 0,
+  maintenance_message TEXT NOT NULL DEFAULT '',
+  banner_message TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- Garantiza que siempre exista la fila única
+INSERT OR IGNORE INTO world_state (id) VALUES (1);
+
+CREATE TABLE IF NOT EXISTS anticheat_flags (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  license_id INTEGER NOT NULL REFERENCES licenses(id),
+  reason TEXT NOT NULL,           -- 'cooldown' | 'value_out_of_range:<campo>'
+  field TEXT,                     -- campo concreto que falló (puede ser NULL para cooldown)
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_anticheat_license ON anticheat_flags(license_id, created_at DESC);
+`);
+
 module.exports = db;
