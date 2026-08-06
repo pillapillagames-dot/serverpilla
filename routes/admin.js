@@ -7,18 +7,36 @@ const { listOnline } = require('../lib/onlineTracker');
 
 const router = express.Router();
 
-// Middleware: exige el header x-admin-key
+// ---------------------------------------------------------------------------
+// Auth: clave compartida (Fase 1-4). Fase 5 la reemplazará por adminAuth.js.
+// ---------------------------------------------------------------------------
 function requireAdmin(req, res, next) {
   const key = req.headers['x-admin-key'];
-  if (!key || key !== process.env.ADMIN_KEY) {
+  const expected = Buffer.from(String(process.env.ADMIN_KEY || ''));
+  const given = Buffer.from(String(key || ''));
+  if (
+    !key ||
+    given.length !== expected.length ||
+    !crypto.timingSafeEqual(given, expected)
+  ) {
     return res.status(401).json({ ok: false, error: 'No autorizado.' });
   }
   next();
 }
 router.use(requireAdmin);
 
-// POST /api/admin/keys/generate  body: { count?: number, notes?: string, customerEmail?: string }
-// Devuelve las keys EN CLARO solo esta vez (luego no se pueden recuperar, solo revocar).
+// ---------------------------------------------------------------------------
+// Skin names — deben coincidir con player_data.gd en el cliente
+// ---------------------------------------------------------------------------
+const SKIN_NAMES = [
+  'Básica', 'Lava', 'Esmeralda', 'Oro', 'Fantasma',
+  'Sombra', 'Hielo', 'Tormenta', 'Coral', 'Bosque',
+  'Nebulosa', 'Arena', 'Rubí', 'Zafiro',
+];
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/keys/generate
+// ---------------------------------------------------------------------------
 router.post('/keys/generate', (req, res) => {
   const count = Math.min(parseInt(req.body?.count, 10) || 1, 500);
   const notes = req.body?.notes || null;
@@ -41,7 +59,7 @@ router.post('/keys/generate', (req, res) => {
   res.json({ ok: true, keys: generated });
 });
 
-// GET /api/admin/keys?status=active&limit=50
+// GET /api/admin/keys
 router.get('/keys', (req, res) => {
   const { status, limit } = req.query;
   let rows;
@@ -66,17 +84,16 @@ router.post('/keys/:id/revoke', (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /api/admin/keys/:id/reset-device  (para permitir reactivar en otro PC)
+// POST /api/admin/keys/:id/reset-device
 router.post('/keys/:id/reset-device', (req, res) => {
   const info = db.prepare('UPDATE licenses SET device_id = NULL WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Key no encontrada.' });
   res.json({ ok: true });
 });
 
-// GET /api/admin/purchases?limit=100
-// Historial de compras dentro del juego (con monedas). De momento solo hay
-// un tipo de compra (skins), pero item_type queda ahí listo por si se añaden
-// más cosas comprables en el futuro.
+// ---------------------------------------------------------------------------
+// GET /api/admin/purchases
+// ---------------------------------------------------------------------------
 router.get('/purchases', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
   const rows = db
@@ -99,13 +116,9 @@ router.get('/purchases', (req, res) => {
   res.json({ ok: true, purchases: rows, totalCount: totals.count, totalCoinsSpent: totals.coinsSpent });
 });
 
-// GET /api/admin/online?windowSeconds=300
-// Lista jugadores "activos" (visto en los últimos N segundos, 5 min por
-// defecto) con su email/prefijo de key y sus stats básicas si las tiene.
-// Nota: es una aproximación basada en la última llamada autenticada al
-// servidor (login, stats, sync, etc.), no una conexión en vivo por
-// websocket, así que un jugador puede tardar un poco en desaparecer de
-// esta lista tras cerrar el juego.
+// ---------------------------------------------------------------------------
+// GET /api/admin/online
+// ---------------------------------------------------------------------------
 router.get('/online', (req, res) => {
   const windowSeconds = parseInt(req.query.windowSeconds, 10) || 300;
   const online = listOnline(windowSeconds * 1000);
@@ -136,8 +149,9 @@ router.get('/online', (req, res) => {
   res.json({ ok: true, count: players.length, windowSeconds, players });
 });
 
-// POST /api/admin/releases  body: { version, manifest: {files:[...]}, notes? }
-// (Normalmente esto lo rellena el script build-release.js, no a mano)
+// ---------------------------------------------------------------------------
+// Releases
+// ---------------------------------------------------------------------------
 router.post('/releases', (req, res) => {
   const { version, manifest, notes } = req.body || {};
   if (!version || !manifest) {
@@ -145,9 +159,7 @@ router.post('/releases', (req, res) => {
   }
   try {
     db.prepare('INSERT INTO releases (version, manifest_json, notes) VALUES (?, ?, ?)').run(
-      version,
-      JSON.stringify(manifest),
-      notes || null
+      version, JSON.stringify(manifest), notes || null
     );
     res.json({ ok: true });
   } catch (err) {
@@ -155,14 +167,14 @@ router.post('/releases', (req, res) => {
   }
 });
 
-// GET /api/admin/releases
 router.get('/releases', (req, res) => {
   const rows = db.prepare('SELECT id, version, published_at, notes FROM releases ORDER BY id DESC').all();
   res.json({ ok: true, releases: rows });
 });
 
-// POST /api/admin/news  body: { title, body, date? }
-// Publica una novedad nueva (aparece en la pantalla principal del launcher).
+// ---------------------------------------------------------------------------
+// News
+// ---------------------------------------------------------------------------
 router.post('/news', (req, res) => {
   const { title, body: newsBody, date } = req.body || {};
   if (!title || !newsBody) {
@@ -175,32 +187,25 @@ router.post('/news', (req, res) => {
   res.json({ ok: true, id: info.lastInsertRowid });
 });
 
-// GET /api/admin/news
 router.get('/news', (req, res) => {
   const rows = db.prepare('SELECT id, title, body, date FROM news ORDER BY id DESC').all();
   res.json({ ok: true, news: rows });
 });
 
-// DELETE /api/admin/news/:id
 router.delete('/news/:id', (req, res) => {
   const info = db.prepare('DELETE FROM news WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Novedad no encontrada.' });
   res.json({ ok: true });
 });
 
-// ============================================================
-// A partir de aquí: gestión de las keys del sistema NUEVO
-// (vinculadas a cuenta de Google, guardadas en Postgres).
-// Las de arriba (/keys/*) son del sistema VIEJO por dispositivo,
-// que sigue vivo mientras migramos.
-// ============================================================
-
+// ---------------------------------------------------------------------------
+// Game Keys (sistema nuevo, Postgres)
+// ---------------------------------------------------------------------------
 function generateKeyCode() {
   const groups = Array.from({ length: 4 }, () => crypto.randomBytes(2).toString('hex').toUpperCase());
   return `PILLA-${groups.join('-')}`;
 }
 
-// POST /api/admin/game-keys/generate  body: { count?: number }
 router.post('/game-keys/generate', async (req, res) => {
   const count = Math.min(parseInt(req.body?.count, 10) || 1, 500);
   const generated = [];
@@ -225,7 +230,6 @@ router.post('/game-keys/generate', async (req, res) => {
   }
 });
 
-// GET /api/admin/game-keys?status=active
 router.get('/game-keys', async (req, res) => {
   const { status } = req.query;
   try {
@@ -247,7 +251,6 @@ router.get('/game-keys', async (req, res) => {
   }
 });
 
-// POST /api/admin/game-keys/:id/unlink  (desvincula de la cuenta; vuelve a 'unused')
 router.post('/game-keys/:id/unlink', async (req, res) => {
   try {
     const { rowCount } = await pool.query(
@@ -261,7 +264,6 @@ router.post('/game-keys/:id/unlink', async (req, res) => {
   }
 });
 
-// POST /api/admin/game-keys/:id/revoke
 router.post('/game-keys/:id/revoke', async (req, res) => {
   try {
     const { rowCount } = await pool.query(`UPDATE game_keys SET status = 'revoked' WHERE id = $1`, [
@@ -272,6 +274,285 @@ router.post('/game-keys/:id/revoke', async (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: GET /api/admin/players?search=...&limit=200
+// Lista de jugadores con stats básicas para las secciones Monedas, Inventario
+// y búsqueda general. Devuelve todos los campos que el HTML v5 necesita.
+// ---------------------------------------------------------------------------
+router.get('/players', (req, res) => {
+  const search = (req.query.search || '').trim();
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+
+  let rows;
+  if (search) {
+    const like = `%${search}%`;
+    rows = db.prepare(
+      `SELECT l.id AS licenseId, l.key_prefix, l.customer_email, l.status,
+              ps.username, ps.level, ps.elo, ps.coins, ps.updated_at
+       FROM licenses l
+       LEFT JOIN player_stats ps ON ps.license_id = l.id
+       WHERE ps.username LIKE ? OR l.customer_email LIKE ? OR l.key_prefix LIKE ?
+       ORDER BY ps.updated_at DESC
+       LIMIT ?`
+    ).all(like, like, like, limit);
+  } else {
+    rows = db.prepare(
+      `SELECT l.id AS licenseId, l.key_prefix, l.customer_email, l.status,
+              ps.username, ps.level, ps.elo, ps.coins, ps.updated_at
+       FROM licenses l
+       LEFT JOIN player_stats ps ON ps.license_id = l.id
+       ORDER BY COALESCE(ps.updated_at, l.created_at) DESC
+       LIMIT ?`
+    ).all(limit);
+  }
+
+  res.json({ ok: true, players: rows });
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: POST /api/admin/players/:id/coins   body: { coins }
+// Fija el saldo de monedas de un jugador directamente (no suma).
+// ---------------------------------------------------------------------------
+router.post('/players/:id/coins', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const coins = parseInt(req.body?.coins, 10);
+
+  if (!Number.isFinite(coins) || coins < 0) {
+    return res.status(400).json({ ok: false, error: 'Cantidad de monedas inválida.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = db
+    .prepare(`UPDATE player_stats SET coins = ?, updated_at = datetime('now') WHERE license_id = ?`)
+    .run(coins, licenseId);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
+  res.json({ ok: true, coins });
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: GET /api/admin/players/:id/inventory
+// Devuelve el inventario completo de un jugador: skins, muebles, mascotas,
+// gestos. Los skins incluyen el flag owned para que el HTML pueda pintar
+// cada skin como poseída o no.
+// ---------------------------------------------------------------------------
+router.get('/players/:id/inventory', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+
+  const stats = db
+    .prepare('SELECT unlocked_skins FROM player_stats WHERE license_id = ?')
+    .get(licenseId);
+
+  let unlockedSkins = [0];
+  if (stats) {
+    try { unlockedSkins = JSON.parse(stats.unlocked_skins || '[0]'); } catch (_) {}
+  }
+
+  const skins = SKIN_NAMES.map((name, index) => ({
+    index,
+    name,
+    owned: unlockedSkins.includes(index),
+  }));
+
+  const furniture = db
+    .prepare('SELECT item_id, purchased_at FROM player_house_furniture WHERE license_id = ?')
+    .all(licenseId);
+
+  const pets = db
+    .prepare('SELECT pet_id, species_id, level, nickname, equipped FROM player_pets WHERE license_id = ?')
+    .all(licenseId);
+
+  const gestures = db
+    .prepare('SELECT gesture_id, purchased_at FROM player_gestures WHERE license_id = ?')
+    .all(licenseId);
+
+  res.json({ ok: true, skins, furniture, pets, gestures });
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: POST /api/admin/players/:id/skins   body: { skinIndex, owned }
+// Otorga o quita una skin a un jugador.
+// ---------------------------------------------------------------------------
+router.post('/players/:id/skins', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const { skinIndex, owned } = req.body || {};
+
+  if (
+    !Number.isInteger(skinIndex) ||
+    skinIndex < 0 ||
+    skinIndex >= SKIN_NAMES.length ||
+    typeof owned !== 'boolean'
+  ) {
+    return res.status(400).json({ ok: false, error: 'Parámetros inválidos.' });
+  }
+  // skinIndex 0 es la skin base: no se puede quitar nunca
+  if (skinIndex === 0 && !owned) {
+    return res.status(400).json({ ok: false, error: 'La skin base no se puede quitar.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const row = db.prepare('SELECT unlocked_skins FROM player_stats WHERE license_id = ?').get(licenseId);
+  if (!row) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
+
+  let unlocked;
+  try { unlocked = JSON.parse(row.unlocked_skins || '[0]'); } catch (_) { unlocked = [0]; }
+  if (!Array.isArray(unlocked)) unlocked = [0];
+
+  if (owned && !unlocked.includes(skinIndex)) {
+    unlocked.push(skinIndex);
+  } else if (!owned) {
+    unlocked = unlocked.filter((i) => i !== skinIndex);
+  }
+
+  db.prepare(
+    `UPDATE player_stats SET unlocked_skins = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(JSON.stringify(unlocked), licenseId);
+
+  res.json({ ok: true, unlockedSkins: unlocked });
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: GET /api/admin/matches?sort=matches_played|wins|elo|best_survival_seconds
+// Ranking de jugadores por stats de partidas.
+// ---------------------------------------------------------------------------
+router.get('/matches', (req, res) => {
+  const ALLOWED_SORTS = ['matches_played', 'wins', 'elo', 'best_survival_seconds', 'total_catches'];
+  const sort = ALLOWED_SORTS.includes(req.query.sort) ? req.query.sort : 'matches_played';
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+
+  const players = db.prepare(
+    `SELECT ps.license_id AS licenseId, ps.username, ps.level, ps.elo,
+            ps.matches_played, ps.wins, ps.total_catches, ps.best_survival_seconds,
+            l.key_prefix
+     FROM player_stats ps
+     JOIN licenses l ON l.id = ps.license_id
+     WHERE ps.matches_played > 0
+     ORDER BY ps.${sort} DESC
+     LIMIT ?`
+  ).all(limit);
+
+  const totals = db
+    .prepare(`SELECT COALESCE(SUM(matches_played), 0) AS total FROM player_stats`)
+    .get();
+
+  res.json({ ok: true, players, totalMatches: totals.total });
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: GET /api/admin/anticheat?limit=150
+// Flags de trampa registrados desde /api/player/match-result.
+// ---------------------------------------------------------------------------
+router.get('/anticheat', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit, 10) || 150, 500);
+
+  const flags = db.prepare(
+    `SELECT af.id, af.license_id, af.reason, af.field, af.created_at,
+            l.key_prefix,
+            ps.username
+     FROM anticheat_flags af
+     JOIN licenses l ON l.id = af.license_id
+     LEFT JOIN player_stats ps ON ps.license_id = af.license_id
+     ORDER BY af.id DESC
+     LIMIT ?`
+  ).all(limit);
+
+  // Top reincidentes (más de 1 flag)
+  const topOffenders = db.prepare(
+    `SELECT af.license_id, l.key_prefix, ps.username,
+            COUNT(*) AS flagCount
+     FROM anticheat_flags af
+     JOIN licenses l ON l.id = af.license_id
+     LEFT JOIN player_stats ps ON ps.license_id = af.license_id
+     GROUP BY af.license_id
+     ORDER BY flagCount DESC
+     LIMIT 10`
+  ).all();
+
+  res.json({ ok: true, flags, topOffenders });
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: GET /api/admin/world  /  POST /api/admin/world
+// Estado del servidor: mantenimiento y banner. Se lee desde /api/game/status.
+// ---------------------------------------------------------------------------
+router.get('/world', (req, res) => {
+  const world = db.prepare('SELECT * FROM world_state WHERE id = 1').get();
+  res.json({ ok: true, world });
+});
+
+router.post('/world', (req, res) => {
+  const maintenanceMode = req.body?.maintenanceMode ? 1 : 0;
+  const maintenanceMessage = (req.body?.maintenanceMessage || '').toString().slice(0, 500);
+  const bannerMessage = (req.body?.bannerMessage || '').toString().slice(0, 500);
+
+  db.prepare(
+    `UPDATE world_state
+     SET maintenance_mode = ?, maintenance_message = ?, banner_message = ?,
+         updated_at = datetime('now')
+     WHERE id = 1`
+  ).run(maintenanceMode, maintenanceMessage, bannerMessage);
+
+  const world = db.prepare('SELECT * FROM world_state WHERE id = 1').get();
+  res.json({ ok: true, world });
+});
+
+// ---------------------------------------------------------------------------
+// NUEVO: GET /api/admin/shop/packages  (envuelve /api/shop/packages para admin)
+// GET /api/admin/shop/orders?status=...
+// ---------------------------------------------------------------------------
+router.get('/shop/packages', (req, res) => {
+  // Los paquetes son estáticos (definidos en routes/shop.js). Los duplicamos
+  // aquí en lugar de importar shop.js para no crear dependencia circular.
+  const COIN_PACKAGES = [
+    { id: 'p500',   coins: 500,   priceUsd: 1.99 },
+    { id: 'p1200',  coins: 1200,  priceUsd: 3.99 },
+    { id: 'p2800',  coins: 2800,  priceUsd: 7.99 },
+    { id: 'p6000',  coins: 6000,  priceUsd: 14.99 },
+    { id: 'p12000', coins: 12000, priceUsd: 24.99 },
+  ];
+  res.json({ ok: true, packages: COIN_PACKAGES });
+});
+
+router.get('/shop/orders', (req, res) => {
+  const { status } = req.query;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+
+  let rows;
+  if (status) {
+    rows = db.prepare(
+      `SELECT po.id, po.package_id, po.coins, po.price_usd, po.amount_sol,
+              po.status, po.created_at, po.confirmed_at,
+              l.key_prefix, l.customer_email,
+              ps.username
+       FROM premium_orders po
+       JOIN licenses l ON l.id = po.license_id
+       LEFT JOIN player_stats ps ON ps.license_id = po.license_id
+       WHERE po.status = ?
+       ORDER BY po.id DESC LIMIT ?`
+    ).all(status, limit);
+  } else {
+    rows = db.prepare(
+      `SELECT po.id, po.package_id, po.coins, po.price_usd, po.amount_sol,
+              po.status, po.created_at, po.confirmed_at,
+              l.key_prefix, l.customer_email,
+              ps.username
+       FROM premium_orders po
+       JOIN licenses l ON l.id = po.license_id
+       LEFT JOIN player_stats ps ON ps.license_id = po.license_id
+       ORDER BY po.id DESC LIMIT ?`
+    ).all(limit);
+  }
+
+  const totals = db.prepare(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN status = 'confirmed' THEN coins ELSE 0 END), 0) AS coinsSold,
+            COUNT(CASE WHEN status = 'confirmed' THEN 1 END) AS paidCount
+     FROM premium_orders`
+  ).get();
+
+  res.json({ ok: true, orders: rows, totals });
 });
 
 module.exports = router;
