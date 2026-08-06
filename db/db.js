@@ -410,4 +410,22 @@ CREATE TABLE IF NOT EXISTS anticheat_flags (
 CREATE INDEX IF NOT EXISTS idx_anticheat_license ON anticheat_flags(license_id, created_at DESC);
 `);
 
+// --- Logs de errores reportados por el cliente ---
+db.exec(`
+CREATE TABLE IF NOT EXISTS error_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  license_id INTEGER REFERENCES licenses(id),  -- NULL si el error ocurre antes del login
+  level TEXT NOT NULL DEFAULT 'error',         -- 'error' | 'fatal'
+  message TEXT NOT NULL,
+  stack TEXT,
+  context TEXT,                                -- pantalla/escena donde ocurrió
+  app_version TEXT,
+  platform TEXT,
+  resolved INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_error_logs_created ON error_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_logs_resolved ON error_logs(resolved, created_at DESC);
+`);
+
 module.exports = db;
