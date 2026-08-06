@@ -715,4 +715,119 @@ router.delete('/error-logs/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// ============================================================
+// Moderación de clanes
+// ============================================================
+
+// GET /api/admin/guilds?search=texto
+// Lista de clanes con nombre, tag, líder, nº de miembros y banco de monedas.
+router.get('/guilds', (req, res) => {
+  const search = (req.query.search || '').trim();
+  const clauses = [];
+  const params = [];
+  if (search) {
+    clauses.push('(g.name LIKE ? OR g.tag LIKE ?)');
+    params.push(`%${search}%`, `%${search}%`);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  const rows = db
+    .prepare(
+      `SELECT g.id, g.name, g.tag, g.description, g.leader_license_id, g.level, g.xp,
+              g.bank_coins, g.created_at,
+              COALESCE(ps.username, 'Jugador' || g.leader_license_id) AS leaderUsername,
+              (SELECT COUNT(*) FROM guild_members gm WHERE gm.guild_id = g.id) AS memberCount
+       FROM guilds g
+       LEFT JOIN player_stats ps ON ps.license_id = g.leader_license_id
+       ${where}
+       ORDER BY g.id DESC`
+    )
+    .all(...params);
+
+  res.json({ ok: true, guilds: rows, totalCount: rows.length });
+});
+
+// GET /api/admin/guilds/:id  -> detalle con lista de miembros y roles
+router.get('/guilds/:id', (req, res) => {
+  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(req.params.id);
+  if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
+
+  const members = db
+    .prepare(
+      `SELECT gm.license_id AS licenseId, gm.joined_at AS joinedAt, gm.role AS role,
+              COALESCE(ps.username, 'Jugador' || gm.license_id) AS username,
+              COALESCE(ps.level, 1) AS level,
+              l.key_prefix AS keyPrefix
+       FROM guild_members gm
+       LEFT JOIN player_stats ps ON ps.license_id = gm.license_id
+       LEFT JOIN licenses l ON l.id = gm.license_id
+       WHERE gm.guild_id = ?
+       ORDER BY gm.joined_at ASC`
+    )
+    .all(guild.id);
+
+  res.json({
+    ok: true,
+    guild: {
+      id: guild.id,
+      name: guild.name,
+      tag: guild.tag,
+      description: guild.description,
+      leaderLicenseId: guild.leader_license_id,
+      level: guild.level,
+      xp: guild.xp,
+      bankCoins: guild.bank_coins,
+      createdAt: guild.created_at,
+    },
+    members,
+  });
+});
+
+// POST /api/admin/guilds/:id/dissolve  -> disuelve el clan (borra miembros y mensajes)
+router.post('/guilds/:id/dissolve', (req, res) => {
+  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(req.params.id);
+  if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
+
+  const dissolve = db.transaction(() => {
+    db.prepare('DELETE FROM guild_members WHERE guild_id = ?').run(guild.id);
+    db.prepare('DELETE FROM guild_messages WHERE guild_id = ?').run(guild.id);
+    db.prepare('DELETE FROM guilds WHERE id = ?').run(guild.id);
+  });
+  dissolve();
+
+  logAudit(req, 'guilds.dissolve', `guilds:${guild.id}`, { name: guild.name, tag: guild.tag }).catch(console.error);
+  res.json({ ok: true });
+});
+
+// POST /api/admin/guilds/:id/kick/:licenseId  -> expulsa a un miembro (el líder no puede expulsarse a sí mismo por aquí; usa dissolve)
+router.post('/guilds/:id/kick/:licenseId', (req, res) => {
+  const guildId = Number(req.params.id);
+  const licenseId = Number(req.params.licenseId);
+  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(guildId);
+  if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
+
+  if (guild.leader_license_id === licenseId) {
+    return res.status(400).json({
+      ok: false,
+      error: 'No se puede expulsar al líder del clan; disuelve el clan o transfiere el liderazgo primero.',
+    });
+  }
+
+  const member = db
+    .prepare('SELECT * FROM guild_members WHERE guild_id = ? AND license_id = ?')
+    .get(guildId, licenseId);
+  if (!member) return res.status(404).json({ ok: false, error: 'Ese jugador no pertenece a este clan.' });
+
+  const username = db.prepare('SELECT username FROM player_stats WHERE license_id = ?').get(licenseId)?.username
+    || `Jugador${licenseId}`;
+
+  db.prepare('DELETE FROM guild_members WHERE guild_id = ? AND license_id = ?').run(guildId, licenseId);
+  db.prepare(
+    `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
+  ).run(guildId, `${username} fue expulsado del clan por un administrador.`);
+
+  logAudit(req, 'guilds.kick', `guilds:${guildId}`, { licenseId, username }).catch(console.error);
+  res.json({ ok: true });
+});
+
 module.exports = router;
