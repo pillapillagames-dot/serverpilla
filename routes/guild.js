@@ -17,6 +17,16 @@ const CHAT_HISTORY_LIMIT = 50;
 const MESSAGE_MAX_LENGTH = 200;
 const MAX_DONATION = 100000; // límite defensivo por donación individual
 
+// Escalera de rangos dentro del clan (el líder no está aquí: sigue siendo
+// guilds.leader_license_id). Promote avanza un escalón, demote retrocede
+// uno; el líder se gestiona aparte con /transfer-leader.
+const RANK_LADDER = ['rookie', 'member', 'veteran'];
+const RANK_LABEL = { rookie: 'Nuevo', member: 'Miembro', veteran: 'Veterano' };
+
+function rankLabel(role) {
+  return RANK_LABEL[role] || RANK_LABEL.member;
+}
+
 // Cuánta xp hace falta para pasar del nivel `level` al siguiente. Sube según
 // el propio nivel para que cada nivel cueste un poco más que el anterior.
 function xpToNextLevel(level) {
@@ -149,7 +159,7 @@ router.post('/create', requireToken, (req, res) => {
     .run(name, tag, description, req.license.id);
   const guildId = insert.lastInsertRowid;
 
-  db.prepare('INSERT INTO guild_members (license_id, guild_id) VALUES (?, ?)').run(req.license.id, guildId);
+  db.prepare('INSERT INTO guild_members (license_id, guild_id, role) VALUES (?, ?, ?)').run(req.license.id, guildId, 'veteran');
 
   const guild = getGuildById(guildId);
   res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guildId) });
@@ -172,7 +182,7 @@ router.post('/join', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'Ese clan ya está completo.' });
   }
 
-  db.prepare('INSERT INTO guild_members (license_id, guild_id) VALUES (?, ?)').run(req.license.id, guildId);
+  db.prepare('INSERT INTO guild_members (license_id, guild_id, role) VALUES (?, ?, ?)').run(req.license.id, guildId, 'rookie');
 
   const username = getUsername(req.license.id);
   logGuildEvent(guildId, `➕ ${username} se ha unido al clan.`);
@@ -451,10 +461,8 @@ router.post('/chest/open', requireToken, (req, res) => {
 });
 
 // POST /api/guild/promote  body: { licenseId }  (requiere token, solo el líder)
-// Asciende a un miembro normal a Oficial. Los Oficiales no tienen todavía
-// permisos extra propios en el servidor (de momento solo es un rango visible
-// en la lista de miembros); pensado como paso intermedio antes de ceder el
-// liderazgo del todo con /transfer-leader.
+// Sube un escalón en la escalera de rangos: Nuevo → Miembro → Veterano. El
+// líder se gestiona aparte con /transfer-leader, no por aquí.
 router.post('/promote', requireToken, (req, res) => {
   const { licenseId } = req.body || {};
   const membership = getMembership(req.license.id);
@@ -474,19 +482,21 @@ router.post('/promote', requireToken, (req, res) => {
   if (!target) {
     return res.status(404).json({ ok: false, error: 'Ese jugador no está en tu clan.' });
   }
-  if (target.role === 'officer') {
-    return res.status(400).json({ ok: false, error: 'Ese miembro ya es Oficial.' });
+  const currentIndex = RANK_LADDER.indexOf(target.role);
+  const nextRole = RANK_LADDER[currentIndex + 1];
+  if (!nextRole) {
+    return res.status(400).json({ ok: false, error: 'Ese miembro ya es Veterano, el rango máximo antes de Líder.' });
   }
 
-  db.prepare("UPDATE guild_members SET role = 'officer' WHERE license_id = ?").run(licenseId);
+  db.prepare('UPDATE guild_members SET role = ? WHERE license_id = ?').run(nextRole, licenseId);
   const username = getUsername(licenseId);
-  logGuildEvent(guild.id, `⬆️ ${username} ha sido ascendido a Oficial por ${getUsername(req.license.id)}.`);
+  logGuildEvent(guild.id, `⬆️ ${username} ha sido ascendido a ${rankLabel(nextRole)} por ${getUsername(req.license.id)}.`);
 
   res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guild.id) });
 });
 
 // POST /api/guild/demote  body: { licenseId }  (requiere token, solo el líder)
-// Baja a un Oficial de vuelta a miembro normal.
+// Baja un escalón en la escalera de rangos: Veterano → Miembro → Nuevo.
 router.post('/demote', requireToken, (req, res) => {
   const { licenseId } = req.body || {};
   const membership = getMembership(req.license.id);
@@ -506,13 +516,15 @@ router.post('/demote', requireToken, (req, res) => {
   if (!target) {
     return res.status(404).json({ ok: false, error: 'Ese jugador no está en tu clan.' });
   }
-  if (target.role !== 'officer') {
-    return res.status(400).json({ ok: false, error: 'Ese miembro ya es un miembro normal.' });
+  const currentIndex = RANK_LADDER.indexOf(target.role);
+  const prevRole = currentIndex > 0 ? RANK_LADDER[currentIndex - 1] : null;
+  if (!prevRole) {
+    return res.status(400).json({ ok: false, error: 'Ese miembro ya es Nuevo, el rango mínimo.' });
   }
 
-  db.prepare("UPDATE guild_members SET role = 'member' WHERE license_id = ?").run(licenseId);
+  db.prepare('UPDATE guild_members SET role = ? WHERE license_id = ?').run(prevRole, licenseId);
   const username = getUsername(licenseId);
-  logGuildEvent(guild.id, `⬇️ ${username} ha sido descendido a Miembro por ${getUsername(req.license.id)}.`);
+  logGuildEvent(guild.id, `⬇️ ${username} ha sido descendido a ${rankLabel(prevRole)} por ${getUsername(req.license.id)}.`);
 
   res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guild.id) });
 });
@@ -520,7 +532,7 @@ router.post('/demote', requireToken, (req, res) => {
 // POST /api/guild/transfer-leader  body: { licenseId }  (requiere token, solo el líder)
 // Cede el liderazgo del clan a otro miembro de inmediato (a diferencia del
 // traspaso automático de /leave, que solo ocurre cuando el líder abandona el
-// clan). El líder saliente pasa a Oficial en vez de quedar como miembro raso.
+// clan). El líder saliente pasa a Veterano en vez de quedar como miembro raso.
 router.post('/transfer-leader', requireToken, (req, res) => {
   const { licenseId } = req.body || {};
   const membership = getMembership(req.license.id);
@@ -543,8 +555,8 @@ router.post('/transfer-leader', requireToken, (req, res) => {
 
   const oldLeaderId = req.license.id;
   db.prepare('UPDATE guilds SET leader_license_id = ? WHERE id = ?').run(licenseId, guild.id);
-  db.prepare("UPDATE guild_members SET role = 'officer' WHERE license_id = ?").run(oldLeaderId);
-  db.prepare("UPDATE guild_members SET role = 'member' WHERE license_id = ?").run(licenseId);
+  db.prepare("UPDATE guild_members SET role = 'veteran' WHERE license_id = ?").run(oldLeaderId);
+  db.prepare("UPDATE guild_members SET role = 'veteran' WHERE license_id = ?").run(licenseId);
 
   const newLeaderName = getUsername(licenseId);
   const oldLeaderName = getUsername(oldLeaderId);
