@@ -285,14 +285,24 @@ if (!guildMembersColumns.includes('total_donated')) {
   console.log('Migración aplicada: columna total_donated añadida a guild_members');
 }
 
-// Migración: rol dentro del clan ('member' u 'officer'). El líder no se
-// guarda aquí (sigue siendo guilds.leader_license_id, ya existía); esto solo
-// añade un escalón intermedio ("Oficial") para poder ascender/descender
-// miembros sin tener que tocar el liderazgo. Todos los miembros ya
-// existentes arrancan como 'member'.
+// Migración: rol dentro del clan. El líder no se guarda aquí (sigue siendo
+// guilds.leader_license_id, ya existía); esto añade escalones intermedios
+// para poder ascender/descender miembros sin tocar el liderazgo. Todos los
+// miembros ya existentes arrancan como 'member'.
 if (!guildMembersColumns.includes('role')) {
   db.exec("ALTER TABLE guild_members ADD COLUMN role TEXT NOT NULL DEFAULT 'member'");
   console.log('Migración aplicada: columna role añadida a guild_members');
+}
+
+// Migración: se pasa de 2 escalones ('member'/'officer') a 3
+// ('rookie'/'member'/'veteran') para reflejar Nuevo → Miembro → Veterano.
+// Los 'officer' existentes pasan a 'veteran' (equivalente); el resto se
+// queda igual (no se puede saber retroactivamente quién era "nuevo").
+{
+  const migrated = db.prepare("UPDATE guild_members SET role = 'veteran' WHERE role = 'officer'").run();
+  if (migrated.changes > 0) {
+    console.log(`Migración aplicada: ${migrated.changes} miembro(s) de clan de 'officer' a 'veteran'`);
+  }
 }
 
 // Migración: marca de "ya se hizo la sincronización única" de /api/player/sync.
