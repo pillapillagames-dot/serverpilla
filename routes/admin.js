@@ -365,7 +365,7 @@ router.get('/players', (req, res) => {
     const like = `%${search}%`;
     rows = db.prepare(
       `SELECT l.id AS licenseId, l.key_prefix, l.customer_email, l.status,
-              ps.username, ps.level, ps.elo, ps.coins, ps.updated_at
+              ps.username, ps.level, ps.elo, ps.coins, ps.training_coins AS trainingCoins, ps.updated_at
        FROM licenses l
        LEFT JOIN player_stats ps ON ps.license_id = l.id
        WHERE ps.username LIKE ? OR l.customer_email LIKE ? OR l.key_prefix LIKE ?
@@ -375,7 +375,7 @@ router.get('/players', (req, res) => {
   } else {
     rows = db.prepare(
       `SELECT l.id AS licenseId, l.key_prefix, l.customer_email, l.status,
-              ps.username, ps.level, ps.elo, ps.coins, ps.updated_at
+              ps.username, ps.level, ps.elo, ps.coins, ps.training_coins AS trainingCoins, ps.updated_at
        FROM licenses l
        LEFT JOIN player_stats ps ON ps.license_id = l.id
        ORDER BY COALESCE(ps.updated_at, l.created_at) DESC
@@ -405,6 +405,27 @@ router.post('/players/:id/coins', (req, res) => {
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
   logAudit(req, 'players.set-coins', `licenses:${licenseId}`, { coins }).catch(console.error);
   res.json({ ok: true, coins });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/players/:id/training-coins   body: { trainingCoins }
+// ---------------------------------------------------------------------------
+router.post('/players/:id/training-coins', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const trainingCoins = parseInt(req.body?.trainingCoins, 10);
+
+  if (!Number.isFinite(trainingCoins) || trainingCoins < 0) {
+    return res.status(400).json({ ok: false, error: 'Cantidad de monedas de entrenamiento inválida.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = db
+    .prepare(`UPDATE player_stats SET training_coins = ?, updated_at = datetime('now') WHERE license_id = ?`)
+    .run(trainingCoins, licenseId);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
+  logAudit(req, 'players.set-training-coins', `licenses:${licenseId}`, { trainingCoins }).catch(console.error);
+  res.json({ ok: true, trainingCoins });
 });
 
 // ---------------------------------------------------------------------------
@@ -828,6 +849,24 @@ router.post('/guilds/:id/kick/:licenseId', (req, res) => {
 
   logAudit(req, 'guilds.kick', `guilds:${guildId}`, { licenseId, username }).catch(console.error);
   res.json({ ok: true });
+});
+
+// POST /api/admin/guilds/:id/bank-coins  body: { bankCoins }  -> fija el banco del clan
+router.post('/guilds/:id/bank-coins', (req, res) => {
+  const guildId = Number(req.params.id);
+  const bankCoins = parseInt(req.body?.bankCoins, 10);
+
+  if (!Number.isFinite(bankCoins) || bankCoins < 0) {
+    return res.status(400).json({ ok: false, error: 'Cantidad de banco inválida.' });
+  }
+
+  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(guildId);
+  if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
+
+  db.prepare('UPDATE guilds SET bank_coins = ? WHERE id = ?').run(bankCoins, guildId);
+
+  logAudit(req, 'guilds.set-bank-coins', `guilds:${guildId}`, { bankCoins }).catch(console.error);
+  res.json({ ok: true, bankCoins });
 });
 
 module.exports = router;
