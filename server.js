@@ -11,7 +11,9 @@ const versionRoutes = require('./routes/version');
 const downloadRoutes = require('./routes/download');
 const playerRoutes = require('./routes/player');
 const shopRoutes = require('./routes/shop');
-const adminRoutes = require('./routes/admin');
+const adminModule = require('./routes/admin');
+const adminRoutes = adminModule;
+const adminPublicRoutes = adminModule.publicRouter;
 const guildRoutes = require('./routes/guild');
 const friendsRoutes = require('./routes/friends');
 const battleRoutes = require('./routes/battle');
@@ -21,9 +23,7 @@ const gestureRoutes = require('./routes/gestures');
 const errorRoutes = require('./routes/errors');
 const app = express();
 
-// --- CORS: permite que páginas web (tienda, launcher web, etc.) llamen
-// a esta API desde el navegador. Sin esto, el navegador bloquea la
-// petición en el "preflight" OPTIONS antes de que llegue a tus rutas. ---
+// --- CORS ---
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -34,7 +34,7 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// --- Rutas públicas de login (fuera de /api, las visita el navegador) ---
+// --- Rutas públicas ---
 app.use('/auth', authRoutes);
 
 // --- Rutas /api/* ---
@@ -43,6 +43,8 @@ app.use('/api/game', licenseRoutes);
 app.use('/api/game', statusRoutes);
 app.use('/api/game', versionRoutes);
 app.use('/api/game', downloadRoutes);
+// Broadcast público — el cliente Godot puede consultar sin token de admin
+app.use('/api/game', adminPublicRoutes);
 app.use('/api/player', playerRoutes);
 app.use('/api/shop', shopRoutes);
 app.use('/api/admin', adminRoutes);
