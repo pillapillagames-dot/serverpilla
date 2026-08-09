@@ -938,4 +938,514 @@ router.post('/guilds/:id/bank-coins', (req, res) => {
   res.json({ ok: true, bankCoins });
 });
 
+
+// ============================================================
+// NUEVOS ENDPOINTS — Admin v26
+// Todos los módulos que el panel necesita y aún no existían:
+//   - GET  /api/admin/auth/me
+//   - POST /api/admin/shop/packages  (crear paquete nuevo)
+//   - DELETE /api/admin/shop/packages/:id
+//   - POST /api/admin/shop/wallet
+//   - POST /api/admin/players/:id/title
+//   - POST /api/admin/players/:id/story-dlc
+//   - POST /api/admin/players/:id/pets/grant + DELETE pets/:petId
+//   - POST /api/admin/players/:id/gestures (grant/revoke por owned)
+//   - POST /api/admin/broadcast
+//   - POST /api/admin/battlepass/advance-season
+//   - POST /api/admin/battlepass/reset-xp
+//   - GET  /api/admin/reports  (placeholder + tabla auto-creada)
+//   - POST /api/admin/reports/:id/action
+//   - GET  /api/admin/ban-history
+//   - GET  /api/admin/analytics  (métricas calculadas)
+//   - POST /api/admin/world (extendido con battlepassSeasonEnd)
+// ============================================================
+
+// ---------------------------------------------------------------------------
+// GET /api/admin/auth/me — Verifica sesión activa y devuelve datos del admin
+// ---------------------------------------------------------------------------
+router.get('/auth/me', (req, res) => {
+  res.json({
+    ok: true,
+    username: req.adminUser?.username || 'admin',
+    role: req.adminUser?.role || 'owner',
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/shop/packages — Crear paquete nuevo
+// body: { coins, priceUsd, sortOrder? }
+// El PUT existente solo editaba; este crea con ID generado automáticamente.
+// ---------------------------------------------------------------------------
+router.post('/shop/packages', (req, res) => {
+  const { coins, priceUsd, sortOrder = 0 } = req.body || {};
+
+  if (!Number.isInteger(coins) || coins <= 0) {
+    return res.status(400).json({ ok: false, error: 'coins debe ser entero positivo.' });
+  }
+  if (typeof priceUsd !== 'number' || !Number.isFinite(priceUsd) || priceUsd <= 0) {
+    return res.status(400).json({ ok: false, error: 'priceUsd debe ser número positivo.' });
+  }
+
+  // ID generado a partir de coins para mantener convención existente (p500, p1200…)
+  const id = `p${coins}_${Date.now()}`;
+
+  db.prepare(
+    `INSERT INTO shop_packages (id, coins, price_usd, sort_order) VALUES (?, ?, ?, ?)`
+  ).run(id, coins, priceUsd, sortOrder);
+
+  const created = db.prepare(
+    'SELECT id, coins, price_usd AS priceUsd, sort_order AS sortOrder FROM shop_packages WHERE id = ?'
+  ).get(id);
+
+  logAudit(req, 'shop.create-package', `shop_packages:${id}`, { coins, priceUsd }).catch(console.error);
+  res.json({ ok: true, package: created });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/admin/shop/packages/:id — Eliminar paquete
+// ---------------------------------------------------------------------------
+router.delete('/shop/packages/:id', (req, res) => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM shop_packages WHERE id = ?').get(id);
+  if (!existing) {
+    return res.status(404).json({ ok: false, error: 'Paquete no encontrado.' });
+  }
+  db.prepare('DELETE FROM shop_packages WHERE id = ?').run(id);
+  logAudit(req, 'shop.delete-package', `shop_packages:${id}`, { id }).catch(console.error);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/shop/wallet — Cambiar wallet de cobros (MERCHANT_WALLET)
+// body: { wallet }
+// Actualiza la columna treasury_wallet de world_state (fila única).
+// El campo se añade automáticamente si no existe todavía (migración inline).
+// ---------------------------------------------------------------------------
+router.post('/shop/wallet', (req, res) => {
+  const { wallet } = req.body || {};
+  if (!wallet || typeof wallet !== 'string' || wallet.length < 20) {
+    return res.status(400).json({ ok: false, error: 'Dirección de wallet inválida.' });
+  }
+
+  // Migración inline: añadir columna si no existe (SQLite no lanza error si ya existe gracias al try/catch)
+  try {
+    db.exec('ALTER TABLE world_state ADD COLUMN treasury_wallet TEXT NOT NULL DEFAULT ""');
+  } catch (_) { /* columna ya existe, ignorar */ }
+
+  db.prepare(
+    `UPDATE world_state SET treasury_wallet = ?, updated_at = datetime('now') WHERE id = 1`
+  ).run(wallet);
+
+  logAudit(req, 'shop.set-wallet', 'world_state:1', { wallet }).catch(console.error);
+  res.json({ ok: true, wallet });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/players/:id/title — Otorgar o retirar título activo
+// body: { title: "Leyenda" }  o  { title: null }
+// Guarda en la columna active_title de player_stats (migración inline).
+// ---------------------------------------------------------------------------
+router.post('/players/:id/title', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const title = req.body?.title ?? null; // null = retirar título
+
+  // Migración inline
+  try {
+    db.exec('ALTER TABLE player_stats ADD COLUMN active_title TEXT');
+  } catch (_) {}
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = db.prepare(
+    `UPDATE player_stats SET active_title = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(title, licenseId);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
+
+  logAudit(req, title ? 'players.grant-title' : 'players.remove-title', `licenses:${licenseId}`, { title }).catch(console.error);
+  res.json({ ok: true, title });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/players/:id/story-dlc — Otorgar o revocar Story Mode DLC
+// body: { unlocked: true|false }
+// Usa la columna story_mode_unlocked de player_stats (migración inline).
+// ---------------------------------------------------------------------------
+router.post('/players/:id/story-dlc', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const unlocked = Boolean(req.body?.unlocked);
+
+  try {
+    db.exec('ALTER TABLE player_stats ADD COLUMN story_mode_unlocked INTEGER NOT NULL DEFAULT 0');
+  } catch (_) {}
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = db.prepare(
+    `UPDATE player_stats SET story_mode_unlocked = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(unlocked ? 1 : 0, licenseId);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
+
+  logAudit(req, unlocked ? 'players.grant-story-dlc' : 'players.revoke-story-dlc', `licenses:${licenseId}`, { unlocked }).catch(console.error);
+  res.json({ ok: true, unlocked });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/players/:id/pets/grant — Otorgar mascota
+// body: { species_id, nickname? }
+// ---------------------------------------------------------------------------
+router.post('/players/:id/pets/grant', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const { species_id, nickname = null } = req.body || {};
+
+  if (!species_id) {
+    return res.status(400).json({ ok: false, error: 'species_id es obligatorio.' });
+  }
+
+  const petId = `${species_id}_${Date.now()}`;
+  db.prepare(
+    `INSERT INTO player_pets (license_id, pet_id, species_id, nickname, level, equipped)
+     VALUES (?, ?, ?, ?, 1, 0)`
+  ).run(licenseId, petId, species_id, nickname);
+
+  logAudit(req, 'players.grant-pet', `licenses:${licenseId}`, { species_id, petId }).catch(console.error);
+  res.json({ ok: true, petId, species_id, nickname });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/admin/players/:id/pets/:petId — Retirar mascota
+// ---------------------------------------------------------------------------
+router.delete('/players/:id/pets/:petId', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const { petId } = req.params;
+
+  const info = db.prepare(
+    'DELETE FROM player_pets WHERE license_id = ? AND pet_id = ?'
+  ).run(licenseId, petId);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Mascota no encontrada.' });
+  logAudit(req, 'players.remove-pet', `licenses:${licenseId}`, { petId }).catch(console.error);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/players/:id/gestures/grant — Otorgar gesto
+// body: { gesture_id }
+// ---------------------------------------------------------------------------
+router.post('/players/:id/gestures/grant', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const gestureId = String(req.body?.gesture_id ?? '');
+
+  if (!gestureId) {
+    return res.status(400).json({ ok: false, error: 'gesture_id es obligatorio.' });
+  }
+
+  // Ignorar si ya lo tiene
+  const existing = db.prepare(
+    'SELECT id FROM player_gestures WHERE license_id = ? AND gesture_id = ?'
+  ).get(licenseId, gestureId);
+
+  if (!existing) {
+    db.prepare(
+      `INSERT INTO player_gestures (license_id, gesture_id) VALUES (?, ?)`
+    ).run(licenseId, gestureId);
+    logAudit(req, 'players.grant-gesture', `licenses:${licenseId}`, { gestureId }).catch(console.error);
+  }
+
+  res.json({ ok: true, gesture_id: gestureId });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/admin/players/:id/gestures/:gestureId — Retirar gesto
+// ---------------------------------------------------------------------------
+router.delete('/players/:id/gestures/:gestureId', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const { gestureId } = req.params;
+
+  const info = db.prepare(
+    'DELETE FROM player_gestures WHERE license_id = ? AND gesture_id = ?'
+  ).run(licenseId, gestureId);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Gesto no encontrado.' });
+  logAudit(req, 'players.remove-gesture', `licenses:${licenseId}`, { gestureId }).catch(console.error);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/broadcast — Enviar mensaje a todos los jugadores conectados
+// body: { message, duration?, type? }
+// El canal real de push (WebSocket/SSE) se implementa cuando exista. Por
+// ahora guarda el broadcast en una tabla circular (últimos 50) para que el
+// panel muestre historial y los clientes puedan consultarlo en el próximo
+// sync. El cliente Godot puede llamar a GET /api/game/status para ver si
+// hay un broadcast activo.
+// ---------------------------------------------------------------------------
+(() => {
+  // Migración inline de tabla de broadcasts
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS broadcasts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'info',
+        duration INTEGER NOT NULL DEFAULT 10,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL DEFAULT (datetime('now', '+60 seconds'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_broadcasts_expires ON broadcasts(expires_at DESC);
+    `);
+  } catch (_) {}
+})();
+
+router.post('/broadcast', (req, res) => {
+  const { message, duration = 10, type = 'info' } = req.body || {};
+  if (!message || typeof message !== 'string' || message.trim() === '') {
+    return res.status(400).json({ ok: false, error: 'El mensaje es obligatorio.' });
+  }
+  const validTypes = ['info', 'warning', 'event', 'maintenance'];
+  const safeType = validTypes.includes(type) ? type : 'info';
+  const safeDuration = Math.min(Math.max(parseInt(duration, 10) || 10, 1), 300);
+
+  const info = db.prepare(
+    `INSERT INTO broadcasts (message, type, duration, expires_at)
+     VALUES (?, ?, ?, datetime('now', '+' || ? || ' seconds'))`
+  ).run(message.trim(), safeType, safeDuration, safeDuration + 30);
+
+  // Limpiar broadcasts expirados (mantener solo últimos 50)
+  db.prepare(`DELETE FROM broadcasts WHERE id NOT IN (SELECT id FROM broadcasts ORDER BY id DESC LIMIT 50)`).run();
+
+  logAudit(req, 'broadcast.send', `broadcasts:${info.lastInsertRowid}`, { message, type, duration }).catch(console.error);
+  res.json({ ok: true, id: info.lastInsertRowid, message, type, duration: safeDuration });
+});
+
+// GET /api/admin/broadcast/history — Historial de broadcasts recientes
+router.get('/broadcast/history', (req, res) => {
+  const rows = db.prepare(
+    `SELECT id, message, type, duration, created_at, expires_at FROM broadcasts ORDER BY id DESC LIMIT 20`
+  ).all();
+  res.json({ ok: true, broadcasts: rows });
+});
+
+// ---------------------------------------------------------------------------
+// Battle Pass — Avanzar temporada y resetear XP
+// ---------------------------------------------------------------------------
+
+// POST /api/admin/battlepass/advance-season   body: { newSeasonMonth }
+// Avanza la temporada: resetea battlepass_xp, battlepass_tier y
+// battlepass_claimed_tiers de todos los jugadores. La columna seasonMonth
+// no existe en player_stats (viene calculada como el mes actual en el GET
+// /api/admin/battlepass). Para persistirla se usa world_state.
+router.post('/battlepass/advance-season', requireRole('owner'), (req, res) => {
+  const { newSeasonMonth } = req.body || {};
+  if (!newSeasonMonth || !/^\d{4}-\d{2}$/.test(newSeasonMonth)) {
+    return res.status(400).json({ ok: false, error: 'Formato de temporada inválido. Usa YYYY-MM (ej: 2026-09).' });
+  }
+
+  // Migración inline para columna de temporada en world_state
+  try {
+    db.exec('ALTER TABLE world_state ADD COLUMN battlepass_season TEXT');
+  } catch (_) {}
+
+  const resetBP = db.transaction(() => {
+    // Guardar la nueva temporada en world_state
+    db.prepare(
+      `UPDATE world_state SET battlepass_season = ?, updated_at = datetime('now') WHERE id = 1`
+    ).run(newSeasonMonth);
+
+    // Resetear progreso de battle pass de todos los jugadores
+    db.prepare(`
+      UPDATE player_stats
+      SET battlepass_xp = 0, battlepass_tier = 0, battlepass_claimed_tiers = '[]',
+          battlepass_premium = 0, updated_at = datetime('now')
+    `).run();
+  });
+  resetBP();
+
+  const count = db.prepare('SELECT COUNT(*) AS n FROM player_stats').get()?.n || 0;
+  logAudit(req, 'battlepass.advance-season', 'world_state:1', { newSeasonMonth, playersReset: count }).catch(console.error);
+  res.json({ ok: true, newSeasonMonth, playersReset: count });
+});
+
+// POST /api/admin/battlepass/reset-xp — Solo resetea XP/tiers sin cambiar temporada
+router.post('/battlepass/reset-xp', requireRole('owner'), (req, res) => {
+  db.prepare(`
+    UPDATE player_stats
+    SET battlepass_xp = 0, battlepass_tier = 0, battlepass_claimed_tiers = '[]',
+        updated_at = datetime('now')
+  `).run();
+
+  const count = db.prepare('SELECT COUNT(*) AS n FROM player_stats').get()?.n || 0;
+  logAudit(req, 'battlepass.reset-xp', null, { playersReset: count }).catch(console.error);
+  res.json({ ok: true, playersReset: count });
+});
+
+// ---------------------------------------------------------------------------
+// Reportes de jugadores
+// ---------------------------------------------------------------------------
+(() => {
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS player_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reporter_id INTEGER REFERENCES licenses(id),
+        reported_id INTEGER REFERENCES licenses(id),
+        type TEXT NOT NULL DEFAULT 'behavior',
+        severity TEXT NOT NULL DEFAULT 'low',
+        description TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        resolved_by TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_reports_status ON player_reports(status, created_at DESC);
+    `);
+  } catch (_) {}
+})();
+
+// GET /api/admin/reports?status=&type=
+router.get('/reports', (req, res) => {
+  const { status, type } = req.query;
+  const conditions = [];
+  const params = [];
+
+  if (status) { conditions.push('pr.status = ?'); params.push(status); }
+  if (type) { conditions.push('pr.type = ?'); params.push(type); }
+
+  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+  const rows = db.prepare(`
+    SELECT pr.id, pr.type, pr.severity, pr.description, pr.status, pr.created_at,
+           r.key_prefix AS reporter_key_prefix, rps.username AS reporter_username,
+           t.key_prefix AS reported_key_prefix, tps.username AS reported_username
+    FROM player_reports pr
+    LEFT JOIN licenses r ON r.id = pr.reporter_id
+    LEFT JOIN player_stats rps ON rps.license_id = pr.reporter_id
+    LEFT JOIN licenses t ON t.id = pr.reported_id
+    LEFT JOIN player_stats tps ON tps.license_id = pr.reported_id
+    ${where}
+    ORDER BY pr.id DESC
+    LIMIT 200
+  `).all(...params);
+
+  res.json({ ok: true, reports: rows });
+});
+
+// POST /api/admin/reports/:id/action   body: { action: 'actioned'|'dismiss'|'open' }
+router.post('/reports/:id/action', (req, res) => {
+  const { action } = req.body || {};
+  const validActions = ['actioned', 'dismiss', 'open'];
+  if (!validActions.includes(action)) {
+    return res.status(400).json({ ok: false, error: 'Acción inválida.' });
+  }
+
+  const statusMap = { actioned: 'actioned', dismiss: 'dismissed', open: 'open' };
+  const info = db.prepare(
+    `UPDATE player_reports SET status = ?, resolved_by = ? WHERE id = ?`
+  ).run(statusMap[action], req.adminUser?.username || 'admin', req.params.id);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Reporte no encontrado.' });
+  logAudit(req, `reports.${action}`, `player_reports:${req.params.id}`, { action }).catch(console.error);
+  res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Historial de baneos — lee del audit_log filtrando acciones de moderación
+// ---------------------------------------------------------------------------
+router.get('/ban-history', async (req, res) => {
+  const { search, limit: rawLimit } = req.query;
+  const limit = Math.min(parseInt(rawLimit, 10) || 200, 1000);
+
+  try {
+    const searchClause = search ? `AND (al.details::text ILIKE $2 OR al.target ILIKE $2)` : '';
+    const params = [limit];
+    if (search) params.push(`%${search}%`);
+
+    const { rows } = await pool.query(
+      `SELECT al.id, al.admin_username, al.action, al.target, al.details, al.created_at
+       FROM admin_audit_log al
+       WHERE al.action IN ('keys.revoke','players.ban','guilds.kick','guilds.dissolve','auth.ban')
+       ${searchClause}
+       ORDER BY al.created_at DESC
+       LIMIT $1`,
+      params
+    );
+
+    // Normalizar para el frontend
+    const bans = rows.map(r => ({
+      id: r.id,
+      admin: r.admin_username,
+      action: r.action,
+      target: r.target,
+      reason: r.details?.reason || r.details?.notes || '—',
+      target_username: r.details?.username || r.details?.name || null,
+      target_key_prefix: r.details?.keyPrefix || null,
+      created_at: r.created_at,
+      active: true,
+    }));
+
+    res.json({ ok: true, bans, total: bans.length });
+  } catch (err) {
+    // Si Postgres no está disponible o la tabla no tiene filas con esas acciones,
+    // devuelve array vacío en vez de 500 para que el panel muestre "sin registros"
+    res.json({ ok: true, bans: [], total: 0, _note: 'Pendiente de audit_log con acciones de moderación.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Analytics — métricas calculadas a partir de tablas existentes
+// No requiere tabla nueva: usa player_stats, purchases, premium_orders, anticheat_flags
+// ---------------------------------------------------------------------------
+router.get('/analytics', (req, res) => {
+  try {
+    const totalPlayers = db.prepare('SELECT COUNT(*) AS n FROM player_stats').get()?.n || 0;
+    const totalMatches = db.prepare('SELECT SUM(matches_played) AS n FROM player_stats').get()?.n || 0;
+    const totalPurchases = db.prepare('SELECT COUNT(*) AS n FROM purchases').get()?.n || 0;
+    const totalCoinsSpent = db.prepare('SELECT SUM(price) AS n FROM purchases').get()?.n || 0;
+    const premiumCount = db.prepare(
+      'SELECT COUNT(*) AS n FROM player_stats WHERE battlepass_premium = 1'
+    ).get()?.n || 0;
+    const avgCoins = db.prepare('SELECT AVG(coins) AS n FROM player_stats').get()?.n || 0;
+    const avgLevel = db.prepare('SELECT AVG(level) AS n FROM player_stats').get()?.n || 0;
+    const flagsTotal = db.prepare('SELECT COUNT(*) AS n FROM anticheat_flags').get()?.n || 0;
+
+    res.json({
+      ok: true,
+      totalPlayers,
+      totalMatches,
+      totalPurchases,
+      totalCoinsSpent,
+      premiumCount,
+      avgCoins: Math.round(avgCoins),
+      avgLevel: Math.round(avgLevel * 10) / 10,
+      flagsTotal,
+      conversionRate: totalPlayers > 0
+        ? Math.round(premiumCount / totalPlayers * 1000) / 10
+        : 0,
+      matchesPerPlayer: totalPlayers > 0
+        ? Math.round(totalMatches / totalPlayers * 10) / 10
+        : 0,
+      _source: 'calculated_from_existing_tables',
+      _note: 'DAU/retención/sesiones requieren tabla session_events. Ver instrucciones en Admin Console.',
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/game/broadcast — Endpoint público para que el cliente Godot
+// consulte si hay un broadcast activo (sin auth de admin).
+// El cliente puede llamar a esto periódicamente junto con /api/game/status.
+// ---------------------------------------------------------------------------
+// (Este endpoint se registra en el router de admin pero necesita estar
+//  accesible sin requireAdminSession. Lo exponemos mediante un router
+//  separado exportado al final del módulo para que server.js lo monte en
+//  /api/game o un path accesible por el cliente.)
+const publicRouter = express.Router();
+publicRouter.get('/broadcast', (req, res) => {
+  const now = new Date().toISOString();
+  const active = db.prepare(
+    `SELECT id, message, type, duration FROM broadcasts WHERE expires_at > ? ORDER BY id DESC LIMIT 1`
+  ).get(now);
+  res.json({ ok: true, broadcast: active || null });
+});
+
 module.exports = router;
+module.exports.publicRouter = publicRouter;
