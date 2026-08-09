@@ -429,6 +429,75 @@ router.post('/players/:id/training-coins', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/admin/battlepass?search=...&limit=200
+// Estado del Pase de Batalla (temporada = mes actual) por jugador.
+// ---------------------------------------------------------------------------
+router.get('/battlepass', (req, res) => {
+  const search = (req.query.search || '').trim();
+  const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+  const cur = new Date().toISOString().slice(0, 7); // 'YYYY-MM', igual que currentMonthKey()
+
+  const base = `
+    SELECT l.id AS licenseId, l.customer_email, ps.username,
+           ps.battle_pass_xp AS battlePassXp,
+           ps.battle_pass_month AS battlePassMonth,
+           ps.battle_pass_claimed AS battlePassClaimedRaw,
+           ps.battle_pass_premium AS battlePassPremium,
+           ps.updated_at
+    FROM licenses l
+    LEFT JOIN player_stats ps ON ps.license_id = l.id
+    ${search ? 'WHERE ps.username LIKE ? OR l.customer_email LIKE ?' : ''}
+    ORDER BY ps.battle_pass_xp DESC
+    LIMIT ?
+  `;
+  const rows = search
+    ? db.prepare(base).all(`%${search}%`, `%${search}%`, limit)
+    : db.prepare(base).all(limit);
+
+  const players = rows.map((r) => {
+    const inSeason = r.battlePassMonth === cur;
+    const xp = inSeason ? r.battlePassXp || 0 : 0;
+    let claimedCount = 0;
+    try {
+      claimedCount = inSeason ? (JSON.parse(r.battlePassClaimedRaw || '[]').length || 0) : 0;
+    } catch (e) {
+      claimedCount = 0;
+    }
+    return {
+      licenseId: r.licenseId,
+      username: r.username,
+      customerEmail: r.customer_email,
+      battlePassXp: xp,
+      battlePassTier: Math.min(Math.floor(xp / 150), 20),
+      battlePassClaimedCount: claimedCount,
+      battlePassPremium: inSeason ? !!r.battlePassPremium : false,
+      updatedAt: r.updated_at,
+    };
+  });
+
+  res.json({ ok: true, seasonMonth: cur, players });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/players/:id/battlepass-premium   body: { premium }
+// Fuerza (o revoca) el Premium de la temporada actual a mano, al margen del
+// botón "Activar Premium" gratis que ya tiene el jugador en el juego.
+// ---------------------------------------------------------------------------
+router.post('/players/:id/battlepass-premium', (req, res) => {
+  const licenseId = parseInt(req.params.id, 10);
+  const premium = !!req.body?.premium;
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = db
+    .prepare(`UPDATE player_stats SET battle_pass_premium = ?, updated_at = datetime('now') WHERE license_id = ?`)
+    .run(premium ? 1 : 0, licenseId);
+
+  if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
+  logAudit(req, 'players.set-battlepass-premium', `licenses:${licenseId}`, { premium }).catch(console.error);
+  res.json({ ok: true, battlePassPremium: premium });
+});
+
+// ---------------------------------------------------------------------------
 // GET /api/admin/players/:id/inventory
 // ---------------------------------------------------------------------------
 router.get('/players/:id/inventory', (req, res) => {
