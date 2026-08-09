@@ -80,16 +80,12 @@ function parseUnlockedSkins(raw) {
 // (el cliente solo las usa para pintar la pantalla; el servidor es quien
 // manda de verdad sobre si se puede reclamar y qué se da).
 const BATTLE_PASS_XP_PER_TIER = 150;
-// FIX (pendiente): estos "furniture" están reflejados aquí solo para que
-// tabla no se desincronice de scripts/player_progression.gd (mismo criterio
-// que coins/skin), pero /claim-battlepass-tier de más abajo TODAVÍA NO los
-// concede: no existe columna battle_pass_premium en player_stats (el
-// endpoint POST /api/player/buy-battlepass tampoco está implementado, ver
-// nota en scripts/server_sync.gd::buy_battle_pass) así que el servidor no
-// tiene forma de saber si la cuenta tiene Premium. Hasta que se añada esa
-// columna + el endpoint de compra, el mueble solo se regala en el reclamo
-// LOCAL (sin token, ver PlayerProgression.claim_battle_pass_tier), igual
-// que ya pasaba con el multiplicador x2 de monedas Premium.
+// Recompensas Premium: el multiplicador x2 de monedas se aplica a TODOS los
+// niveles con Premium activo (ver claim-battlepass-tier); los "furniture"
+// solo se entregan si la cuenta tiene battle_pass_premium = 1 en la
+// temporada actual. Con el pase gratis (sin Premium) esos niveles solo dan
+// las monedas base, sin mueble. Mismo criterio que scripts/player_data.gd
+// en el cliente: si cambias una recompensa, cámbiala también allí.
 const BATTLE_PASS_TIERS = [
   { coins: 20 },
   { coins: 20 },
@@ -183,6 +179,7 @@ function seasonPayload(stats) {
     battlePassXp: stats.battle_pass_xp,
     battlePassTier: battlePassTierFromXp(stats.battle_pass_xp),
     battlePassClaimed: parseJsonArray(stats.battle_pass_claimed),
+    battlePassPremium: !!stats.battle_pass_premium,
     tournamentPoints: stats.tournament_points,
     tournamentClaimed: parseJsonArray(stats.tournament_claimed),
     tournamentWins: stats.tournament_wins,
@@ -626,18 +623,55 @@ router.post('/claim-battlepass-tier', requireToken, (req, res) => {
   }
 
   const reward = BATTLE_PASS_TIERS[tier - 1];
+  const isPremium = !!stats.battle_pass_premium;
+  const coinsAwarded = (reward.coins || 0) * (isPremium ? 2 : 1);
+  const newCoins = stats.coins + coinsAwarded;
+
   const unlocked = parseUnlockedSkins(stats.unlocked_skins);
-  const newCoins = stats.coins + (reward.coins || 0);
   if (typeof reward.skin === 'number' && !unlocked.includes(reward.skin)) {
     unlocked.push(reward.skin);
   }
+
+  // El mueble de este nivel (si lo hay) solo se entrega con Premium activo.
+  if (reward.furniture && isPremium) {
+    db.prepare(
+      `INSERT OR IGNORE INTO player_house_furniture (license_id, item_id) VALUES (?, ?)`
+    ).run(req.license.id, reward.furniture);
+  }
+
   claimed.push(tier);
 
   db.prepare(
     `UPDATE player_stats SET coins = ?, unlocked_skins = ?, battle_pass_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(newCoins, JSON.stringify(unlocked), JSON.stringify(claimed), req.license.id);
 
-  res.json({ ok: true, coins: newCoins, unlockedSkins: unlocked, battlePassClaimed: claimed });
+  res.json({
+    ok: true,
+    coins: newCoins,
+    unlockedSkins: unlocked,
+    battlePassClaimed: claimed,
+    battlePassPremium: isPremium,
+    furnitureAwarded: reward.furniture && isPremium ? reward.furniture : null,
+  });
+});
+
+// POST /api/player/buy-battlepass  (requiere token)
+// De momento el Premium es gratis (botón "Activar Premium" en el juego,
+// igual que las keys gratis): activa la cuenta para el resto de la
+// temporada actual. Cuando haya cobro real, este es el único endpoint que
+// hay que tocar (aquí es donde iría la validación de la compra).
+router.post('/buy-battlepass', requireToken, (req, res) => {
+  const stats = ensureSeason(req.license.id);
+
+  if (stats.battle_pass_premium) {
+    return res.status(400).json({ ok: false, error: 'Ya tienes el Pase Premium esta temporada.' });
+  }
+
+  db.prepare(
+    `UPDATE player_stats SET battle_pass_premium = 1, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(req.license.id);
+
+  res.json({ ok: true, battlePassPremium: true, seasonMonth: currentMonthKey() });
 });
 
 // POST /api/player/claim-tournament-milestone  body: { milestoneIndex }  (requiere token)
