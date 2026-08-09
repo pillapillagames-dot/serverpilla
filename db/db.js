@@ -225,6 +225,15 @@ if (!playerStatsColumns.includes('battle_pass_claimed')) {
   db.exec("ALTER TABLE player_stats ADD COLUMN battle_pass_claimed TEXT NOT NULL DEFAULT '[]'");
   console.log('Migración aplicada: columna battle_pass_claimed añadida a player_stats');
 }
+// Migración: si la cuenta tiene el pase Premium de la temporada actual.
+// Se reinicia a 0 cada vez que cambia el mes (ver ensureSeason), igual que
+// battle_pass_xp/battle_pass_claimed. De momento se concede gratis (botón
+// "Activar Premium" en el juego) o a mano desde el panel admin; cuando haya
+// cobro real, /api/player/buy-battlepass es el único sitio que hay que tocar.
+if (!playerStatsColumns.includes('battle_pass_premium')) {
+  db.exec("ALTER TABLE player_stats ADD COLUMN battle_pass_premium INTEGER NOT NULL DEFAULT 0");
+  console.log('Migración aplicada: columna battle_pass_premium añadida a player_stats');
+}
 if (!playerStatsColumns.includes('tournament_points')) {
   db.exec("ALTER TABLE player_stats ADD COLUMN tournament_points INTEGER NOT NULL DEFAULT 0");
   console.log('Migración aplicada: columna tournament_points añadida a player_stats');
