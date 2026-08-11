@@ -178,6 +178,18 @@ router.get('/room/:id', requireToken, async (req, res) => {
   res.json({ ok: true, ...info });
 });
 
+
+// ---------------------------------------------------------------------------
+// POST /api/battle/create  — crea una sala vacía en el relay sin invitar a nadie.
+// El host la usa cuando quiere hostear una partida y compartir el roomId
+// manualmente (p.ej. pegándolo en un chat externo) o antes de invitar.
+// ---------------------------------------------------------------------------
+router.post('/create', requireToken, asyncHandler(async (req, res) => {
+  const mode = (req.body?.mode || 'normal').toString().trim();
+  const roomId = createRoom();
+  res.json({ ok: true, roomId });
+}));
+
 // ---------------------------------------------------------------------------
 // GET /api/battle/rooms  — número de salas activas (solo para admin panel)
 // No requiere token de licencia — lo filtra el middleware de admin en server.js
