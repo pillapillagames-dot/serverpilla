@@ -238,12 +238,18 @@ async function ensureSchema(pool) {
       id SERIAL PRIMARY KEY,
       from_license_id INTEGER NOT NULL REFERENCES licenses(id),
       to_license_id INTEGER NOT NULL REFERENCES licenses(id),
-      host_ip TEXT NOT NULL,
-      host_port INTEGER NOT NULL DEFAULT 8910,
+      host_ip TEXT NOT NULL DEFAULT '',
+      host_port INTEGER NOT NULL DEFAULT 0,
+      room_id TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Fase B: columna room_id para el relay WebSocket.
+  // ADD IF NOT EXISTS por si la tabla ya existía sin ella (Fase A).
+  await pool.query(`ALTER TABLE game_invites ADD COLUMN IF NOT EXISTS room_id TEXT;`);
+  await pool.query(`ALTER TABLE game_invites ALTER COLUMN host_ip SET DEFAULT '';`);
+  await pool.query(`ALTER TABLE game_invites ALTER COLUMN host_port SET DEFAULT 0;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_game_invites_to ON game_invites(to_license_id, status);`);
 
   await pool.query(`
@@ -420,5 +426,47 @@ async function ensureSchema(pool) {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_status ON player_reports(status, created_at DESC);`);
 }
+
+  // --- Fase C: Matchmaking y salas públicas ---
+
+  // Cola de matchmaking: jugadores esperando partida
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS matchmaking_queue (
+      license_id INTEGER PRIMARY KEY REFERENCES licenses(id),
+      username TEXT NOT NULL,
+      elo INTEGER NOT NULL DEFAULT 0,
+      mode TEXT NOT NULL DEFAULT 'casual',
+      queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mmq_mode_elo ON matchmaking_queue(mode, elo);`);
+
+  // Salas activas (creadas por matchmaking o manualmente)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mm_rooms (
+      room_id TEXT PRIMARY KEY,
+      mode TEXT NOT NULL DEFAULT 'casual',
+      status TEXT NOT NULL DEFAULT 'waiting',
+      max_players INTEGER NOT NULL DEFAULT 8,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      started_at TIMESTAMPTZ,
+      host_license_id INTEGER REFERENCES licenses(id)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mmrooms_status ON mm_rooms(status, created_at DESC);`);
+
+  // Miembros de cada sala de matchmaking
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS mm_room_members (
+      room_id TEXT NOT NULL REFERENCES mm_rooms(room_id) ON DELETE CASCADE,
+      license_id INTEGER NOT NULL REFERENCES licenses(id),
+      username TEXT NOT NULL,
+      elo INTEGER NOT NULL DEFAULT 0,
+      joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (room_id, license_id)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mmrm_license ON mm_room_members(license_id);`);
+
 
 module.exports = { ensureSchema };

@@ -1,10 +1,13 @@
 require('dotenv').config();
+const http = require('http');
 const express = require('express');
 require('./lib/asyncErrors'); // debe ir antes de requerir cualquier routes/*.js
 const { pool } = require('./db/pg');
 const { ensureSchema } = require('./db/schema');
 const { ensureAdminAuthSchema } = require('./lib/adminAuth');
 const { startShopWatcher } = require('./lib/shopWatcher');
+const { startRelay } = require('./lib/relay');
+const { startMatchmaker } = require('./lib/matchmaker');
 const authRoutes = require('./routes/auth');
 const sessionRoutes = require('./routes/session');
 const { router: licenseRoutes } = require('./routes/license');
@@ -19,6 +22,7 @@ const adminPublicRoutes = adminModule.publicRouter;
 const guildRoutes = require('./routes/guild');
 const friendsRoutes = require('./routes/friends');
 const battleRoutes = require('./routes/battle');
+const matchmakingRoutes = require('./routes/matchmaking');
 const houseRoutes = require('./routes/house');
 const petRoutes = require('./routes/pets');
 const gestureRoutes = require('./routes/gestures');
@@ -53,6 +57,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/guild', guildRoutes);
 app.use('/api/friends', friendsRoutes);
 app.use('/api/battle', battleRoutes);
+app.use('/api/matchmaking', matchmakingRoutes);
 app.use('/api/player/house', houseRoutes);
 app.use('/api/player/pets', petRoutes);
 app.use('/api/player/gestures', gestureRoutes);
@@ -81,8 +86,15 @@ async function start() {
     console.error('Error preparando el esquema de Postgres:', err);
   }
   startShopWatcher();
-  app.listen(PORT, () => {
-    console.log(`pilla-pilla-server escuchando en el puerto ${PORT}`);
+
+  // El servidor HTTP comparte puerto con el WebSocket del relay.
+  // Railway solo expone un puerto por servicio, así que ambos van sobre el mismo.
+  const httpServer = http.createServer(app);
+  startRelay(httpServer);
+  startMatchmaker();
+
+  httpServer.listen(PORT, () => {
+    console.log(`pilla-pilla-server escuchando en el puerto ${PORT} (HTTP + WebSocket relay)`);
   });
 }
 
