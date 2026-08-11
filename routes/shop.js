@@ -13,8 +13,8 @@ const router = express.Router();
 // Paquetes de monedas premium. Viven en la tabla shop_packages (editable
 // desde el admin) en vez de hardcodeados, para poder cambiar monedas y
 // precio sin desplegar.
-function getCoinPackages() {
-  return db.prepare('SELECT id, coins, price_usd AS priceUsd FROM shop_packages ORDER BY sort_order ASC, id ASC').all();
+async function getCoinPackages() {
+  return await db.prepare('SELECT id, coins, price_usd AS priceUsd FROM shop_packages ORDER BY sort_order ASC, id ASC').all();
 }
 
 // Un pedido caduca a los 20 minutos si no se paga: pasado ese tiempo el
@@ -22,8 +22,8 @@ function getCoinPackages() {
 // SOL también puede haber cambiado bastante).
 const ORDER_TTL_MINUTES = 20;
 
-function findPackage(packageId) {
-  return getCoinPackages().find((p) => p.id === packageId);
+async function findPackage(packageId) {
+  return (await getCoinPackages()).find((p) => p.id === packageId);
 }
 
 // GET /api/shop/packages  (público, sin token: se puede pintar la tienda
@@ -31,7 +31,7 @@ function findPackage(packageId) {
 router.get('/packages', async (req, res) => {
   try {
     const solPriceUsd = await getSolPrice();
-    const packages = getCoinPackages().map((p) => ({
+    const packages = (await getCoinPackages()).map((p) => ({
       ...p,
       priceSol: Number((p.priceUsd / solPriceUsd).toFixed(6)),
     }));
@@ -50,7 +50,7 @@ router.get('/packages', async (req, res) => {
 // en SOL (para pagar a mano), y una "reference" única que identifica este
 // pedido en la blockchain sin necesitar cuentas de usuario en Solana.
 router.post('/create-order', requireToken, async (req, res) => {
-  const pkg = findPackage(req.body?.packageId);
+  const pkg = await findPackage(req.body?.packageId);
   if (!pkg) {
     return res.status(400).json({ ok: false, error: 'Paquete de monedas inválido.' });
   }
@@ -76,13 +76,20 @@ router.post('/create-order', requireToken, async (req, res) => {
     message: `${pkg.coins} monedas Pilla Pilla`,
   });
 
-  const info = db
+  const info = await db
     .prepare(
       `INSERT INTO premium_orders
          (license_id, package_id, coins, price_usd, amount_sol, reference, status, expires_at)
        VALUES (?, ?, ?, ?, ?, ?, 'pending', datetime('now', '+${ORDER_TTL_MINUTES} minutes'))`
     )
-    .run(req.license.id, pkg.id, pkg.coins, pkg.priceUsd, amountSol.toString(), reference.toBase58());
+    .run(
+    req.license.id,
+    pkg.id,
+    pkg.coins,
+    pkg.priceUsd,
+    amountSol.toString(),
+    reference.toBase58()
+  );
 
   res.json({
     ok: true,
@@ -99,8 +106,8 @@ router.post('/create-order', requireToken, async (req, res) => {
 // GET /api/shop/qr/:orderId  (requiere token)
 // Genera al vuelo el QR de pago como PNG, para que Godot solo tenga que
 // cargarlo como textura (no hace falta ninguna librería de QR en el cliente).
-router.get('/qr/:orderId', requireToken, (req, res) => {
-  const order = db
+router.get('/qr/:orderId', requireToken, async (req, res) => {
+  const order = await db
     .prepare('SELECT * FROM premium_orders WHERE id = ? AND license_id = ?')
     .get(req.params.orderId, req.license.id);
 
@@ -122,21 +129,21 @@ router.get('/qr/:orderId', requireToken, (req, res) => {
 // El cliente hace polling de este endpoint mientras el pedido está
 // pendiente. "confirmed" lo pone el watcher en segundo plano (ver
 // lib/shopWatcher.js) en cuanto detecta el pago en la blockchain.
-router.get('/order-status/:orderId', requireToken, (req, res) => {
-  const order = db
+router.get('/order-status/:orderId', requireToken, async (req, res) => {
+  const order = await db
     .prepare('SELECT * FROM premium_orders WHERE id = ? AND license_id = ?')
     .get(req.params.orderId, req.license.id);
 
   if (!order) return res.status(404).json({ ok: false, error: 'Pedido no encontrado.' });
 
   if (order.status === 'pending' && new Date(`${order.expires_at.replace(' ', 'T')}Z`).getTime() < Date.now()) {
-    db.prepare(`UPDATE premium_orders SET status = 'expired' WHERE id = ?`).run(order.id);
+    await db.prepare(`UPDATE premium_orders SET status = 'expired' WHERE id = ?`).run(order.id);
     order.status = 'expired';
   }
 
   const payload = { ok: true, status: order.status, coins: order.coins };
   if (order.status === 'confirmed') {
-    const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+    const stats = await db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
     payload.newBalance = stats ? stats.coins : undefined;
   }
   res.json(payload);

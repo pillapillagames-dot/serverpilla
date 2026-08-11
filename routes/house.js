@@ -23,30 +23,30 @@ const { getCatalogItem } = require('../data/houseCatalog');
 
 const router = express.Router();
 
-function getOwnedFurniture(licenseId) {
-  return db
+async function getOwnedFurniture(licenseId) {
+  return (await db
     .prepare('SELECT item_id FROM player_house_furniture WHERE license_id = ?')
-    .all(licenseId)
+    .all(licenseId))
     .map((r) => r.item_id);
 }
 
-function getCoins(licenseId) {
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(licenseId);
+async function getCoins(licenseId) {
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const stats = await db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(licenseId);
   return stats ? stats.coins : 0;
 }
 
 // GET /api/player/house
-router.get('/', requireToken, (req, res) => {
-  const houseRow = db
+router.get('/', requireToken, async (req, res) => {
+  const houseRow = await db
     .prepare('SELECT layout_json FROM player_houses WHERE license_id = ?')
     .get(req.license.id);
 
   res.json({
     ok: true,
     layout: houseRow ? JSON.parse(houseRow.layout_json) : [],
-    ownedFurniture: getOwnedFurniture(req.license.id),
-    coins: getCoins(req.license.id),
+    ownedFurniture: await getOwnedFurniture(req.license.id),
+    coins: await getCoins(req.license.id),
   });
 });
 
@@ -54,11 +54,11 @@ router.get('/', requireToken, (req, res) => {
 // Guarda la disposición de muebles. Valida en el servidor que cada pieza no
 // gratuita/especial esté realmente comprada, para que no se pueda colar
 // nada manipulando el cliente.
-router.post('/save', requireToken, (req, res) => {
+router.post('/save', requireToken, async (req, res) => {
   const layout = Array.isArray(req.body?.layout) ? req.body.layout : null;
   if (!layout) return res.status(400).json({ ok: false, error: 'layout inválido' });
 
-  const owned = new Set(getOwnedFurniture(req.license.id));
+  const owned = new Set(await getOwnedFurniture(req.license.id));
 
   for (const entry of layout) {
     const catalogItem = getCatalogItem(entry.itemId);
@@ -72,7 +72,7 @@ router.post('/save', requireToken, (req, res) => {
   }
 
   const layoutJson = JSON.stringify(layout);
-  db.prepare(
+  await db.prepare(
     `INSERT INTO player_houses (license_id, layout_json, updated_at)
      VALUES (?, ?, datetime('now'))
      ON CONFLICT (license_id) DO UPDATE SET layout_json = excluded.layout_json, updated_at = datetime('now')`
@@ -84,36 +84,30 @@ router.post('/save', requireToken, (req, res) => {
 // POST /api/player/house/buy  body: { itemId }
 // Compra autoritativa: el servidor comprueba precio y monedas, resta y
 // registra el mueble comprado, igual que /api/player/buy-skin.
-router.post('/buy', requireToken, (req, res) => {
+router.post('/buy', requireToken, async (req, res) => {
   const itemId = req.body?.itemId;
   const catalogItem = getCatalogItem(itemId);
   if (!catalogItem || catalogItem.category === 'especial') {
     return res.status(400).json({ ok: false, error: 'Mueble no disponible para compra' });
   }
 
-  const already = db
+  const already = await db
     .prepare('SELECT 1 FROM player_house_furniture WHERE license_id = ? AND item_id = ?')
     .get(req.license.id, itemId);
   if (already) {
-    return res.json({ ok: true, alreadyOwned: true, coins: getCoins(req.license.id) });
+    return res.json({ ok: true, alreadyOwned: true, coins: await getCoins(req.license.id) });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = await db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
   const currentCoins = stats ? stats.coins : 0;
   if (currentCoins < catalogItem.price) {
     return res.status(400).json({ ok: false, error: 'No tienes suficientes monedas' });
   }
 
   const newCoins = currentCoins - catalogItem.price;
-  db.prepare(`UPDATE player_stats SET coins = ?, updated_at = datetime('now') WHERE license_id = ?`).run(
-    newCoins,
-    req.license.id
-  );
-  db.prepare('INSERT INTO player_house_furniture (license_id, item_id) VALUES (?, ?)').run(
-    req.license.id,
-    itemId
-  );
+  await db.prepare(`UPDATE player_stats SET coins = ?, updated_at = datetime('now') WHERE license_id = ?`).run(newCoins, req.license.id);
+  await db.prepare('INSERT INTO player_house_furniture (license_id, item_id) VALUES (?, ?)').run(req.license.id, itemId);
 
   res.json({ ok: true, coins: newCoins });
 });

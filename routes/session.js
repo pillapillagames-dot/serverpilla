@@ -28,21 +28,21 @@ function requireSession(req, res, next) {
 // cuenta de Google, un device_id fijo tipo google:<userId>. Así reutilizamos
 // TAL CUAL todo el sistema de player_stats / manifest / descargas que ya
 // funciona, sin tocar esos archivos.
-function ensureBridgeLicense(userId, email) {
+async function ensureBridgeLicense(userId, email) {
   const deviceId = `google:${userId}`;
-  let license = sqliteDb.prepare('SELECT * FROM licenses WHERE device_id = ?').get(deviceId);
+  let license = await sqliteDb.prepare('SELECT * FROM licenses WHERE device_id = ?').get(deviceId);
   if (license) return license;
 
   const fakeKeyHash = bcrypt.hashSync(crypto.randomUUID(), 4);
-  const info = sqliteDb
+  const info = await sqliteDb
     .prepare(
       `INSERT INTO licenses (key_hash, key_prefix, status, device_id, customer_email, activated_at)
        VALUES (?, 'GOOGLE', 'active', ?, ?, datetime('now'))`
     )
     .run(fakeKeyHash, deviceId, email || null);
 
-  sqliteDb.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(info.lastInsertRowid);
-  return sqliteDb.prepare('SELECT * FROM licenses WHERE id = ?').get(info.lastInsertRowid);
+  await sqliteDb.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(info.lastInsertRowid);
+  return await sqliteDb.prepare('SELECT * FROM licenses WHERE id = ?').get(info.lastInsertRowid);
 }
 
 function issueLicenseToken(license, userId, email) {
@@ -56,7 +56,7 @@ function issueLicenseToken(license, userId, email) {
 // GET /api/session/validate
 // El launcher llama esto al arrancar para saber: ¿hay sesión de Google?
 // ¿esa cuenta ya tiene una key canjeada?
-router.get('/session/validate', (req, res) => {
+router.get('/session/validate', async (req, res) => {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return res.json({ ok: true, loggedIn: false });
@@ -72,7 +72,7 @@ router.get('/session/validate', (req, res) => {
     // reconocemos que ya tiene licencia, sin que tenga que volver a escribir
     // la key.
     const deviceId = `google:${payload.userId}`;
-    const license = sqliteDb.prepare('SELECT * FROM licenses WHERE device_id = ?').get(deviceId);
+    const license = await sqliteDb.prepare('SELECT * FROM licenses WHERE device_id = ?').get(deviceId);
     const hasLicense = !!license && license.status === 'active';
 
     if (hasLicense) {
@@ -123,7 +123,7 @@ router.post('/redeem', requireSession, async (req, res) => {
     }
     // Si ya estaba activa en ESTA misma cuenta, no hay nada que cambiar (reintento idempotente).
 
-    const license = ensureBridgeLicense(req.session.userId, req.session.email);
+    const license = await ensureBridgeLicense(req.session.userId, req.session.email);
     const token = issueLicenseToken(license, req.session.userId, req.session.email);
 
     return res.json({ ok: true, token });

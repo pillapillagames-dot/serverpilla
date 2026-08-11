@@ -149,9 +149,9 @@ function battlePassTierFromXp(xp) {
 // para siempre (no se tocan monedas ni skins). Autoritativo: el servidor
 // decide cuándo cambia el mes, no el cliente. Devuelve la fila de stats ya
 // al día (recién leída o recién reseteada).
-function ensureSeason(licenseId) {
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  let stats = db.prepare('SELECT * FROM player_stats WHERE license_id = ?').get(licenseId);
+async function ensureSeason(licenseId) {
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  let stats = await db.prepare('SELECT * FROM player_stats WHERE license_id = ?').get(licenseId);
   const cur = currentMonthKey();
   const updates = {};
   if (stats.battle_pass_month !== cur) {
@@ -166,9 +166,9 @@ function ensureSeason(licenseId) {
   }
   if (Object.keys(updates).length > 0) {
     const setClause = Object.keys(updates).map((k) => `${k} = ?`).join(', ');
-    db.prepare(`UPDATE player_stats SET ${setClause}, updated_at = datetime('now') WHERE license_id = ?`)
+    await db.prepare(`UPDATE player_stats SET ${setClause}, updated_at = datetime('now') WHERE license_id = ?`)
       .run(...Object.values(updates), licenseId);
-    stats = db.prepare('SELECT * FROM player_stats WHERE license_id = ?').get(licenseId);
+    stats = await db.prepare('SELECT * FROM player_stats WHERE license_id = ?').get(licenseId);
   }
   return stats;
 }
@@ -189,8 +189,8 @@ function seasonPayload(stats) {
 }
 
 // GET /api/player/stats  (requiere token de licencia, igual que /api/game/manifest)
-router.get('/stats', requireToken, (req, res) => {
-  const stats = ensureSeason(req.license.id);
+router.get('/stats', requireToken, async (req, res) => {
+  const stats = await ensureSeason(req.license.id);
 
   res.json({
     ok: true,
@@ -215,7 +215,7 @@ router.get('/stats', requireToken, (req, res) => {
 // Guarda el nickname de forma permanente, vinculado a la licencia del jugador.
 const NICKNAME_REGEX = /^[a-zA-Z0-9_]{3,16}$/; // letras, números y "_", 3-16 caracteres
 
-router.post('/nickname', requireToken, (req, res) => {
+router.post('/nickname', requireToken, async (req, res) => {
   const nickname = (req.body?.nickname || '').trim();
 
   if (!NICKNAME_REGEX.test(nickname)) {
@@ -226,7 +226,7 @@ router.post('/nickname', requireToken, (req, res) => {
   }
 
   // Comprueba que no lo esté usando ya otro jugador (comparación insensible a mayúsculas)
-  const taken = db
+  const taken = await db
     .prepare('SELECT license_id FROM player_stats WHERE lower(username) = lower(?) AND license_id != ?')
     .get(nickname, req.license.id);
 
@@ -234,8 +234,8 @@ router.post('/nickname', requireToken, (req, res) => {
     return res.status(409).json({ ok: false, error: 'Ese nickname ya está en uso.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  db.prepare(
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  await db.prepare(
     `UPDATE player_stats SET username = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(nickname, req.license.id);
 
@@ -276,12 +276,12 @@ router.post('/nickname', requireToken, (req, res) => {
 const MATCH_RESULT_COOLDOWN_MS = 10 * 1000;
 const _lastMatchResultAt = new Map();
 
-router.post('/match-result', requireToken, (req, res) => {
+router.post('/match-result', requireToken, async (req, res) => {
   const now = Date.now();
   const lastAt = _lastMatchResultAt.get(req.license.id) || 0;
   if (now - lastAt < MATCH_RESULT_COOLDOWN_MS) {
     try {
-      db.prepare(`INSERT INTO anticheat_flags (license_id, reason) VALUES (?, 'cooldown')`).run(req.license.id);
+      await db.prepare(`INSERT INTO anticheat_flags (license_id, reason) VALUES (?, 'cooldown')`).run(req.license.id);
     } catch (_) { /* no bloquear la respuesta si falla el registro */ }
     return res.status(429).json({ ok: false, error: 'Estás mandando resultados de partida demasiado rápido.' });
   }
@@ -310,7 +310,7 @@ router.post('/match-result', requireToken, (req, res) => {
     const { min, max } = MATCH_LIMITS[key];
     if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
       try {
-        db.prepare(`INSERT INTO anticheat_flags (license_id, reason, field) VALUES (?, 'value_out_of_range', ?)`).run(req.license.id, key);
+        await db.prepare(`INSERT INTO anticheat_flags (license_id, reason, field) VALUES (?, 'value_out_of_range', ?)`).run(req.license.id, key);
       } catch (_) { /* no bloquear */ }
       return res.status(400).json({ ok: false, error: `Valor inválido: ${key}` });
     }
@@ -320,7 +320,7 @@ router.post('/match-result', requireToken, (req, res) => {
   // el rating de golpe.
   if (typeof eloDelta !== 'number' || !Number.isFinite(eloDelta) || eloDelta < -200 || eloDelta > 200) {
     try {
-      db.prepare(`INSERT INTO anticheat_flags (license_id, reason, field) VALUES (?, 'value_out_of_range', 'eloDelta')`).run(req.license.id);
+      await db.prepare(`INSERT INTO anticheat_flags (license_id, reason, field) VALUES (?, 'value_out_of_range', 'eloDelta')`).run(req.license.id);
     } catch (_) { /* no bloquear */ }
     return res.status(400).json({ ok: false, error: 'Valor inválido: eloDelta' });
   }
@@ -335,7 +335,7 @@ router.post('/match-result', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'Valor inválido: tournamentPlacement' });
   }
 
-  const stats = ensureSeason(req.license.id);
+  const stats = await ensureSeason(req.license.id);
 
   // Suma monedas, victorias, partidas jugadas y pilladas totales
   let newCoins = stats.coins + Math.round(coinsEarned);
@@ -381,7 +381,7 @@ router.post('/match-result', requireToken, (req, res) => {
     newTournamentMatches += 1;
   }
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET
        coins = ?,
        xp = ?,
@@ -468,7 +468,7 @@ const TRAINING_COINS_MAX_PER_CALL = 100; // margen sobre el máximo legítimo (4
 const TRAINING_COINS_COOLDOWN_MS = 10 * 1000;
 const _lastTrainingCoinsAt = new Map();
 
-router.post('/training-coins-earned', requireToken, (req, res) => {
+router.post('/training-coins-earned', requireToken, async (req, res) => {
   const now = Date.now();
   const lastAt = _lastTrainingCoinsAt.get(req.license.id) || 0;
   if (now - lastAt < TRAINING_COINS_COOLDOWN_MS) {
@@ -480,14 +480,14 @@ router.post('/training-coins-earned', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'Cantidad de monedas de entrenamiento inválida.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  db.prepare(
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  await db.prepare(
     `UPDATE player_stats SET training_coins = training_coins + ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(amount, req.license.id);
 
   _lastTrainingCoinsAt.set(req.license.id, now);
 
-  const row = db.prepare('SELECT training_coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const row = await db.prepare('SELECT training_coins FROM player_stats WHERE license_id = ?').get(req.license.id);
   res.json({ ok: true, trainingCoins: row.training_coins });
 });
 
@@ -503,9 +503,9 @@ router.post('/training-coins-earned', requireToken, (req, res) => {
 // player_stats.synced_at guarda cuándo se hizo la única sincronización
 // válida; cualquier intento posterior se rechaza aquí, sin importar qué
 // mande el cliente ni desde qué dispositivo.
-router.post('/sync', requireToken, (req, res) => {
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const existing = db.prepare('SELECT synced_at FROM player_stats WHERE license_id = ?').get(req.license.id);
+router.post('/sync', requireToken, async (req, res) => {
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const existing = await db.prepare('SELECT synced_at FROM player_stats WHERE license_id = ?').get(req.license.id);
   if (existing && existing.synced_at) {
     return res.status(409).json({ ok: false, error: 'Esta licencia ya se sincronizó anteriormente.' });
   }
@@ -548,7 +548,7 @@ router.post('/sync', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'Valor inválido: xp supera xpToNextLevel' });
   }
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET
        coins = ?,
        level = ?,
@@ -561,21 +561,31 @@ router.post('/sync', requireToken, (req, res) => {
        synced_at = datetime('now'),
        updated_at = datetime('now')
      WHERE license_id = ?`
-  ).run(coins, level, xp, xpToNextLevel, matchesPlayed, totalCatches, bestSurvivalSeconds, elo, req.license.id);
+  ).run(
+    coins,
+    level,
+    xp,
+    xpToNextLevel,
+    matchesPlayed,
+    totalCatches,
+    bestSurvivalSeconds,
+    elo,
+    req.license.id
+  );
 
   res.json({ ok: true });
 });
 
 // POST /api/player/buy-skin  body: { skinIndex }  (requiere token)
-router.post('/buy-skin', requireToken, (req, res) => {
+router.post('/buy-skin', requireToken, async (req, res) => {
   const { skinIndex } = req.body || {};
 
   if (typeof skinIndex !== 'number' || !Number.isInteger(skinIndex) || skinIndex < 0 || skinIndex >= SKIN_PRICES.length) {
     return res.status(400).json({ ok: false, error: 'Skin inválida.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT * FROM player_stats WHERE license_id = ?').get(req.license.id);
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = await db.prepare('SELECT * FROM player_stats WHERE license_id = ?').get(req.license.id);
 
   const unlocked = parseUnlockedSkins(stats.unlocked_skins);
 
@@ -591,11 +601,11 @@ router.post('/buy-skin', requireToken, (req, res) => {
   const newCoins = stats.coins - price;
   unlocked.push(skinIndex);
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET coins = ?, unlocked_skins = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(newCoins, JSON.stringify(unlocked), req.license.id);
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO purchases (license_id, item_type, item_index, price, coins_after) VALUES (?, 'skin', ?, ?, ?)`
   ).run(req.license.id, skinIndex, price, newCoins);
 
@@ -603,14 +613,14 @@ router.post('/buy-skin', requireToken, (req, res) => {
 });
 
 // POST /api/player/claim-battlepass-tier  body: { tier }  (requiere token)
-router.post('/claim-battlepass-tier', requireToken, (req, res) => {
+router.post('/claim-battlepass-tier', requireToken, async (req, res) => {
   const { tier } = req.body || {};
 
   if (!Number.isInteger(tier) || tier < 1 || tier > BATTLE_PASS_TIERS.length) {
     return res.status(400).json({ ok: false, error: 'Nivel de pase inválido.' });
   }
 
-  const stats = ensureSeason(req.license.id);
+  const stats = await ensureSeason(req.license.id);
   const claimed = parseJsonArray(stats.battle_pass_claimed);
 
   if (claimed.includes(tier)) {
@@ -634,16 +644,21 @@ router.post('/claim-battlepass-tier', requireToken, (req, res) => {
 
   // El mueble de este nivel (si lo hay) solo se entrega con Premium activo.
   if (reward.furniture && isPremium) {
-    db.prepare(
+    await db.prepare(
       `INSERT OR IGNORE INTO player_house_furniture (license_id, item_id) VALUES (?, ?)`
     ).run(req.license.id, reward.furniture);
   }
 
   claimed.push(tier);
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET coins = ?, unlocked_skins = ?, battle_pass_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
-  ).run(newCoins, JSON.stringify(unlocked), JSON.stringify(claimed), req.license.id);
+  ).run(
+    newCoins,
+    JSON.stringify(unlocked),
+    JSON.stringify(claimed),
+    req.license.id
+  );
 
   res.json({
     ok: true,
@@ -660,14 +675,14 @@ router.post('/claim-battlepass-tier', requireToken, (req, res) => {
 // igual que las keys gratis): activa la cuenta para el resto de la
 // temporada actual. Cuando haya cobro real, este es el único endpoint que
 // hay que tocar (aquí es donde iría la validación de la compra).
-router.post('/buy-battlepass', requireToken, (req, res) => {
-  const stats = ensureSeason(req.license.id);
+router.post('/buy-battlepass', requireToken, async (req, res) => {
+  const stats = await ensureSeason(req.license.id);
 
   if (stats.battle_pass_premium) {
     return res.status(400).json({ ok: false, error: 'Ya tienes el Pase Premium esta temporada.' });
   }
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET battle_pass_premium = 1, updated_at = datetime('now') WHERE license_id = ?`
   ).run(req.license.id);
 
@@ -675,14 +690,14 @@ router.post('/buy-battlepass', requireToken, (req, res) => {
 });
 
 // POST /api/player/claim-tournament-milestone  body: { milestoneIndex }  (requiere token)
-router.post('/claim-tournament-milestone', requireToken, (req, res) => {
+router.post('/claim-tournament-milestone', requireToken, async (req, res) => {
   const { milestoneIndex } = req.body || {};
 
   if (!Number.isInteger(milestoneIndex) || milestoneIndex < 0 || milestoneIndex >= TOURNAMENT_MILESTONES.length) {
     return res.status(400).json({ ok: false, error: 'Hito de torneo inválido.' });
   }
 
-  const stats = ensureSeason(req.license.id);
+  const stats = await ensureSeason(req.license.id);
   const claimed = parseJsonArray(stats.tournament_claimed);
 
   if (claimed.includes(milestoneIndex)) {
@@ -701,9 +716,14 @@ router.post('/claim-tournament-milestone', requireToken, (req, res) => {
   }
   claimed.push(milestoneIndex);
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET coins = ?, unlocked_skins = ?, tournament_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
-  ).run(newCoins, JSON.stringify(unlocked), JSON.stringify(claimed), req.license.id);
+  ).run(
+    newCoins,
+    JSON.stringify(unlocked),
+    JSON.stringify(claimed),
+    req.license.id
+  );
 
   res.json({ ok: true, coins: newCoins, unlockedSkins: unlocked, tournamentClaimed: claimed });
 });
@@ -725,24 +745,24 @@ router.post('/claim-tournament-milestone', requireToken, (req, res) => {
 // player_stats.achievements_claimed) y el servidor decide cuánto se paga
 // mirando su propio catálogo (achievementCatalog.js), no lo que mande el
 // cliente. Así el saldo del servidor deja de quedarse atrás.
-try {
-  db.prepare('ALTER TABLE player_stats ADD COLUMN achievements_claimed TEXT').run();
-} catch (e) {
-  // La columna ya existe (better-sqlite3 lanza aquí si el ALTER se repite
-  // en un arranque posterior); no es un error real, se ignora.
-}
+//
+// La columna achievements_claimed ya la garantiza db/schema.js en el
+// arranque (antes era una migración inline con ALTER TABLE + try/catch,
+// pero eso dependía de que better-sqlite3 lanzase una excepción síncrona
+// para "columna ya existe" -- con Postgres ya no hace falta ni es válido
+// ejecutar un await a nivel de módulo).
 
 const { ACHIEVEMENT_COINS } = require('../data/achievementCatalog');
 
 // POST /api/player/claim-achievement  body: { achievementId }  (requiere token)
-router.post('/claim-achievement', requireToken, (req, res) => {
+router.post('/claim-achievement', requireToken, async (req, res) => {
   const achievementId = req.body?.achievementId;
   if (typeof achievementId !== 'string' || !(achievementId in ACHIEVEMENT_COINS)) {
     return res.status(400).json({ ok: false, error: 'Logro desconocido.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT coins, achievements_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = await db.prepare('SELECT coins, achievements_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
   const claimed = parseJsonArray(stats.achievements_claimed);
 
   if (claimed.includes(achievementId)) {
@@ -753,7 +773,7 @@ router.post('/claim-achievement', requireToken, (req, res) => {
   const newCoins = stats.coins + reward;
   claimed.push(achievementId);
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET coins = ?, achievements_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(newCoins, JSON.stringify(claimed), req.license.id);
 
@@ -783,11 +803,8 @@ const MAX_SEND_AMOUNT = 100000; // límite defensivo por envío
 // MAX en player_data.gd) -- así un JWT robado no puede usarse para
 // autoconcederse monedas infinitas llamando a este endpoint en bucle con
 // ids inventados.
-try {
-  db.prepare('ALTER TABLE player_stats ADD COLUMN mailbox_gifts_claimed TEXT').run();
-} catch (e) {
-  // La columna ya existe; no es un error real, se ignora (igual que arriba).
-}
+//
+// La columna mailbox_gifts_claimed ya la garantiza db/schema.js.
 
 const MAILBOX_GIFT_COINS_MIN = 15;  // = MAILBOX_COINS_MIN en player_data.gd
 const MAILBOX_GIFT_COINS_MAX = 120; // = MAILBOX_COINS_MAX en player_data.gd
@@ -797,7 +814,7 @@ const MAILBOX_GIFT_COINS_MAX = 120; // = MAILBOX_COINS_MAX en player_data.gd
 // al saldo que el resto de pantallas validan contra el servidor, así que
 // se quedan como estaban (solo locales, ver claim_mailbox_gift en el
 // cliente).
-router.post('/claim-mailbox-gift', requireToken, (req, res) => {
+router.post('/claim-mailbox-gift', requireToken, async (req, res) => {
   const giftId = (req.body?.giftId || '').toString();
   const amount = Math.trunc(Number(req.body?.amount));
 
@@ -808,8 +825,8 @@ router.post('/claim-mailbox-gift', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'Cantidad de regalo inválida.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT coins, mailbox_gifts_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = await db.prepare('SELECT coins, mailbox_gifts_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
   const claimed = parseJsonArray(stats.mailbox_gifts_claimed);
 
   if (claimed.includes(giftId)) {
@@ -819,7 +836,7 @@ router.post('/claim-mailbox-gift', requireToken, (req, res) => {
   const newCoins = stats.coins + amount;
   claimed.push(giftId);
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET coins = ?, mailbox_gifts_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(newCoins, JSON.stringify(claimed), req.license.id);
 
@@ -831,12 +848,9 @@ router.post('/claim-mailbox-gift', requireToken, (req, res) => {
 // "coins" solo en LOCAL, sin avisar nunca al servidor -- reclamar el
 // regalo diario o el de bienvenida y luego intentar adoptar una mascota o
 // comprar en la Casa se rechazaba igual que con los regalos del Buzón.
-try {
-  db.prepare('ALTER TABLE player_stats ADD COLUMN daily_claim_date TEXT').run();
-} catch (e) { /* ya existe */ }
-try {
-  db.prepare('ALTER TABLE player_stats ADD COLUMN welcome_gift_claimed INTEGER').run();
-} catch (e) { /* ya existe */ }
+//
+// Las columnas daily_claim_date y welcome_gift_claimed ya las garantiza
+// db/schema.js.
 
 const DAILY_CLAIM_COINS_MIN = 10;  // = DAILY_CLAIM_MIN en player_data.gd
 const DAILY_CLAIM_COINS_MAX = 100; // = DAILY_CLAIM_MAX en player_data.gd
@@ -847,14 +861,14 @@ const WELCOME_GIFT_COINS = 300;    // = WELCOME_GIFT_COINS en player_data.gd
 // cliente): si ya se reclamó hoy, se devuelve el saldo actual sin volver a
 // pagar, así que da igual si esto se llama más de una vez el mismo día
 // (reintento de red, doble tap...).
-router.post('/claim-daily-reward', requireToken, (req, res) => {
+router.post('/claim-daily-reward', requireToken, async (req, res) => {
   const amount = Math.trunc(Number(req.body?.amount));
   if (!Number.isInteger(amount) || amount < DAILY_CLAIM_COINS_MIN || amount > DAILY_CLAIM_COINS_MAX) {
     return res.status(400).json({ ok: false, error: 'Cantidad de regalo diario inválida.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT coins, daily_claim_date FROM player_stats WHERE license_id = ?').get(req.license.id);
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = await db.prepare('SELECT coins, daily_claim_date FROM player_stats WHERE license_id = ?').get(req.license.id);
   const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD, UTC (servidor)
 
   if (stats.daily_claim_date === today) {
@@ -862,7 +876,7 @@ router.post('/claim-daily-reward', requireToken, (req, res) => {
   }
 
   const newCoins = stats.coins + amount;
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET coins = ?, daily_claim_date = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(newCoins, today, req.license.id);
 
@@ -874,16 +888,16 @@ router.post('/claim-daily-reward', requireToken, (req, res) => {
 // welcome_gift_claimed en el cliente. El importe SIEMPRE es
 // WELCOME_GIFT_COINS -- a diferencia del Buzón/diario, este no depende de
 // nada que mande el cliente, así que no hay nada que validar del body.
-router.post('/claim-welcome-gift', requireToken, (req, res) => {
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT coins, welcome_gift_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
+router.post('/claim-welcome-gift', requireToken, async (req, res) => {
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = await db.prepare('SELECT coins, welcome_gift_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
 
   if (stats.welcome_gift_claimed) {
     return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
   }
 
   const newCoins = stats.coins + WELCOME_GIFT_COINS;
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET coins = ?, welcome_gift_claimed = 1, updated_at = datetime('now') WHERE license_id = ?`
   ).run(newCoins, req.license.id);
 
@@ -891,8 +905,8 @@ router.post('/claim-welcome-gift', requireToken, (req, res) => {
 });
 
 
-function canSendCoins(fromId, toId) {
-  const friend = db
+async function canSendCoins(fromId, toId) {
+  const friend = await db
     .prepare(
       `SELECT 1 FROM friendships
        WHERE status = 'accepted'
@@ -901,7 +915,7 @@ function canSendCoins(fromId, toId) {
     .get(fromId, toId, toId, fromId);
   if (friend) return true;
 
-  const sameClan = db
+  const sameClan = await db
     .prepare(
       `SELECT 1 FROM guild_members a
        JOIN guild_members b ON a.guild_id = b.guild_id
@@ -911,7 +925,7 @@ function canSendCoins(fromId, toId) {
   return !!sameClan;
 }
 
-router.post('/send-coins', requireToken, (req, res) => {
+router.post('/send-coins', requireToken, async (req, res) => {
   const username = (req.body?.username || '').toString().trim();
   const amount = Math.trunc(Number(req.body?.amount));
 
@@ -922,40 +936,30 @@ router.post('/send-coins', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: `La cantidad debe ser un número entero entre 1 y ${MAX_SEND_AMOUNT}.` });
   }
 
-  const target = db.prepare('SELECT license_id FROM player_stats WHERE username = ? COLLATE NOCASE').get(username);
+  const target = await db.prepare('SELECT license_id FROM player_stats WHERE username = ? COLLATE NOCASE').get(username);
   if (!target) {
     return res.status(404).json({ ok: false, error: 'No se encontró ningún jugador con ese nombre.' });
   }
   if (target.license_id === req.license.id) {
     return res.status(400).json({ ok: false, error: 'No puedes mandarte monedas a ti mismo.' });
   }
-  if (!canSendCoins(req.license.id, target.license_id)) {
+  if (!(await canSendCoins(req.license.id, target.license_id))) {
     return res.status(403).json({ ok: false, error: 'Solo puedes mandar monedas a amigos o compañeros de clan.' });
   }
 
-  const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const stats = await db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
   if (!stats || stats.coins < amount) {
     return res.status(400).json({ ok: false, error: 'No tienes monedas suficientes.' });
   }
 
-  const tx = db.transaction(() => {
-    db.prepare(`UPDATE player_stats SET coins = coins - ?, updated_at = datetime('now') WHERE license_id = ?`).run(
-      amount,
-      req.license.id
-    );
-    db.prepare(`UPDATE player_stats SET coins = coins + ?, updated_at = datetime('now') WHERE license_id = ?`).run(
-      amount,
-      target.license_id
-    );
-    db.prepare('INSERT INTO coin_transfers (from_license_id, to_license_id, amount) VALUES (?, ?, ?)').run(
-      req.license.id,
-      target.license_id,
-      amount
-    );
+  const tx = db.transaction(async () => {
+    await db.prepare(`UPDATE player_stats SET coins = coins - ?, updated_at = datetime('now') WHERE license_id = ?`).run(amount, req.license.id);
+    await db.prepare(`UPDATE player_stats SET coins = coins + ?, updated_at = datetime('now') WHERE license_id = ?`).run(amount, target.license_id);
+    await db.prepare('INSERT INTO coin_transfers (from_license_id, to_license_id, amount) VALUES (?, ?, ?)').run(req.license.id, target.license_id, amount);
   });
-  tx();
+  await tx();
 
-  const newStats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const newStats = await db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
   res.json({ ok: true, coins: newStats.coins });
 });
 

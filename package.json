@@ -22,6 +22,7 @@
     "pg": "^8.12.0",
     "qrcode": "^1.5.4"
   },
+  "_comment_better_sqlite3": "Tras la Fase A (migración a Postgres), better-sqlite3 ya NO lo usa el servidor en marcha (db/db.js habla con Postgres) -- se mantiene como dependencia SOLO porque scripts/migrate-to-postgres.js lo necesita para leer db/licenses.db una vez. Se puede quitar cuando ya no haga falta volver a correr esa migración.",
   "overrides": {
     "rpc-websockets": {
       "uuid": "^9.0.1"

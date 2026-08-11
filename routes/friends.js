@@ -6,29 +6,29 @@ const router = express.Router();
 
 const MAX_FRIENDS = 100; // tope defensivo, generoso
 
-function getUsername(licenseId) {
-  const row = db.prepare('SELECT username FROM player_stats WHERE license_id = ?').get(licenseId);
+async function getUsername(licenseId) {
+  const row = await db.prepare('SELECT username FROM player_stats WHERE license_id = ?').get(licenseId);
   return (row && row.username) || `Jugador${licenseId}`;
 }
 
-function getLevel(licenseId) {
-  const row = db.prepare('SELECT level FROM player_stats WHERE license_id = ?').get(licenseId);
+async function getLevel(licenseId) {
+  const row = await db.prepare('SELECT level FROM player_stats WHERE license_id = ?').get(licenseId);
   return (row && row.level) || 1;
 }
 
-function friendCount(licenseId) {
-  return db
+async function friendCount(licenseId) {
+  return (await db
     .prepare(
       `SELECT COUNT(*) AS n FROM friendships
        WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)`
     )
-    .get(licenseId, licenseId).n;
+    .get(licenseId, licenseId)).n;
 }
 
 // Relación existente entre dos jugadores (en cualquier dirección), sea
 // 'pending' o 'accepted'. Se usa para no dejar mandar solicitudes duplicadas.
-function existingRelation(idA, idB) {
-  return db
+async function existingRelation(idA, idB) {
+  return await db
     .prepare(
       `SELECT * FROM friendships
        WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)`
@@ -36,23 +36,23 @@ function existingRelation(idA, idB) {
     .get(idA, idB, idB, idA);
 }
 
-function friendPayload(row, myId) {
+async function friendPayload(row, myId) {
   const otherId = row.requester_id === myId ? row.addressee_id : row.requester_id;
   return {
     requestId: row.id,
     licenseId: otherId,
-    username: getUsername(otherId),
-    level: getLevel(otherId),
+    username: await getUsername(otherId),
+    level: await getLevel(otherId),
     since: row.responded_at || row.created_at,
   };
 }
 
-function requestPayload(row) {
+async function requestPayload(row) {
   return {
     requestId: row.id,
     licenseId: row.requester_id,
-    username: getUsername(row.requester_id),
-    level: getLevel(row.requester_id),
+    username: await getUsername(row.requester_id),
+    level: await getLevel(row.requester_id),
     createdAt: row.created_at,
   };
 }
@@ -60,10 +60,10 @@ function requestPayload(row) {
 // GET /api/friends/mine  (requiere token)
 // Devuelve la lista de amigos aceptados + solicitudes pendientes entrantes
 // (que me han mandado a mí) y salientes (que yo he mandado y aún no responden).
-router.get('/mine', requireToken, (req, res) => {
+router.get('/mine', requireToken, async (req, res) => {
   const myId = req.license.id;
 
-  const accepted = db
+  const accepted = await db
     .prepare(
       `SELECT * FROM friendships
        WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)
@@ -71,23 +71,23 @@ router.get('/mine', requireToken, (req, res) => {
     )
     .all(myId, myId);
 
-  const incoming = db
+  const incoming = await db
     .prepare(`SELECT * FROM friendships WHERE status = 'pending' AND addressee_id = ? ORDER BY created_at DESC`)
     .all(myId);
 
-  const outgoing = db
+  const outgoing = await db
     .prepare(`SELECT * FROM friendships WHERE status = 'pending' AND requester_id = ? ORDER BY created_at DESC`)
     .all(myId);
 
   res.json({
     ok: true,
-    friends: accepted.map((r) => friendPayload(r, myId)),
+    friends: accepted.map(async r => await friendPayload(r, myId)),
     incoming: incoming.map(requestPayload),
-    outgoing: outgoing.map((r) => ({
+    outgoing: outgoing.map(async r => ({
       requestId: r.id,
       licenseId: r.addressee_id,
-      username: getUsername(r.addressee_id),
-      createdAt: r.created_at,
+      username: await getUsername(r.addressee_id),
+      createdAt: r.created_at
     })),
   });
 });
@@ -95,13 +95,13 @@ router.get('/mine', requireToken, (req, res) => {
 // POST /api/friends/request  body: { username }  (requiere token)
 // Busca un jugador por nombre EXACTO (insensible a mayúsculas) y le manda
 // una solicitud de amistad. No hace falta que el destinatario esté online.
-router.post('/request', requireToken, (req, res) => {
+router.post('/request', requireToken, async (req, res) => {
   const username = (req.body?.username || '').toString().trim();
   if (username === '') {
     return res.status(400).json({ ok: false, error: 'Escribe un nombre de usuario.' });
   }
 
-  const target = db
+  const target = await db
     .prepare('SELECT license_id FROM player_stats WHERE username = ? COLLATE NOCASE')
     .get(username);
 
@@ -112,57 +112,52 @@ router.post('/request', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'No puedes agregarte a ti mismo.' });
   }
 
-  if (friendCount(req.license.id) >= MAX_FRIENDS) {
+  if ((await friendCount(req.license.id)) >= MAX_FRIENDS) {
     return res.status(400).json({ ok: false, error: `Ya tienes el máximo de ${MAX_FRIENDS} amigos.` });
   }
 
-  const relation = existingRelation(req.license.id, target.license_id);
+  const relation = await existingRelation(req.license.id, target.license_id);
   if (relation) {
     if (relation.status === 'accepted') {
       return res.status(400).json({ ok: false, error: 'Ya sois amigos.' });
     }
     // pending: si me la mandó él a mí, aceptar en vez de duplicar
     if (relation.requester_id === target.license_id) {
-      db.prepare(`UPDATE friendships SET status = 'accepted', responded_at = datetime('now') WHERE id = ?`).run(
-        relation.id
-      );
+      await db.prepare(`UPDATE friendships SET status = 'accepted', responded_at = datetime('now') WHERE id = ?`).run(relation.id);
       return res.json({ ok: true, autoAccepted: true });
     }
     return res.status(400).json({ ok: false, error: 'Ya le has mandado una solicitud, espera a que responda.' });
   }
 
-  db.prepare('INSERT INTO friendships (requester_id, addressee_id) VALUES (?, ?)').run(
-    req.license.id,
-    target.license_id
-  );
+  await db.prepare('INSERT INTO friendships (requester_id, addressee_id) VALUES (?, ?)').run(req.license.id, target.license_id);
 
   res.json({ ok: true });
 });
 
 // POST /api/friends/accept  body: { requestId }  (requiere token)
-router.post('/accept', requireToken, (req, res) => {
+router.post('/accept', requireToken, async (req, res) => {
   const requestId = Number.parseInt(req.body?.requestId, 10);
-  const row = db
+  const row = await db
     .prepare(`SELECT * FROM friendships WHERE id = ? AND addressee_id = ? AND status = 'pending'`)
     .get(requestId, req.license.id);
 
   if (!row) {
     return res.status(404).json({ ok: false, error: 'Esa solicitud ya no existe.' });
   }
-  if (friendCount(req.license.id) >= MAX_FRIENDS) {
+  if ((await friendCount(req.license.id)) >= MAX_FRIENDS) {
     return res.status(400).json({ ok: false, error: `Ya tienes el máximo de ${MAX_FRIENDS} amigos.` });
   }
 
-  db.prepare(`UPDATE friendships SET status = 'accepted', responded_at = datetime('now') WHERE id = ?`).run(row.id);
+  await db.prepare(`UPDATE friendships SET status = 'accepted', responded_at = datetime('now') WHERE id = ?`).run(row.id);
   res.json({ ok: true });
 });
 
 // POST /api/friends/decline  body: { requestId }  (requiere token)
 // Sirve tanto para rechazar una solicitud entrante como para cancelar una
 // que tú mismo mandaste (en ambos casos, la fila se borra sin más).
-router.post('/decline', requireToken, (req, res) => {
+router.post('/decline', requireToken, async (req, res) => {
   const requestId = Number.parseInt(req.body?.requestId, 10);
-  const info = db
+  const info = await db
     .prepare(
       `DELETE FROM friendships
        WHERE id = ? AND status = 'pending' AND (addressee_id = ? OR requester_id = ?)`
@@ -177,9 +172,9 @@ router.post('/decline', requireToken, (req, res) => {
 
 // POST /api/friends/remove  body: { licenseId }  (requiere token)
 // Elimina una amistad ya aceptada (cualquiera de los dos puede romperla).
-router.post('/remove', requireToken, (req, res) => {
+router.post('/remove', requireToken, async (req, res) => {
   const licenseId = Number.parseInt(req.body?.licenseId, 10);
-  const info = db
+  const info = await db
     .prepare(
       `DELETE FROM friendships
        WHERE status = 'accepted'

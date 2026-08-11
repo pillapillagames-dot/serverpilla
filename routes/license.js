@@ -7,8 +7,8 @@ const { markOnline } = require('../lib/onlineTracker');
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET;
 
-function logAttempt(keyPrefix, deviceId, ip, result) {
-  db.prepare(
+async function logAttempt(keyPrefix, deviceId, ip, result) {
+  await db.prepare(
     'INSERT INTO validation_log (key_prefix, device_id, ip, result) VALUES (?, ?, ?, ?)'
   ).run(keyPrefix || null, deviceId || null, ip || null, result);
 }
@@ -16,7 +16,7 @@ function logAttempt(keyPrefix, deviceId, ip, result) {
 // POST /api/license/activate
 // body: { key, deviceId }
 // Primera vez que se usa la key: la vincula a ese dispositivo y devuelve un token.
-router.post('/activate', (req, res) => {
+router.post('/activate', async (req, res) => {
   const { key, deviceId } = req.body || {};
   const ip = req.ip;
 
@@ -25,22 +25,22 @@ router.post('/activate', (req, res) => {
   }
 
   const prefix = prefixOf(key);
-  const candidates = db.prepare('SELECT * FROM licenses WHERE key_prefix = ?').all(prefix);
+  const candidates = await db.prepare('SELECT * FROM licenses WHERE key_prefix = ?').all(prefix);
   const license = candidates.find((row) => verifyKey(key, row.key_hash));
 
   if (!license) {
-    logAttempt(prefix, deviceId, ip, 'not_found');
+    await logAttempt(prefix, deviceId, ip, 'not_found');
     return res.status(404).json({ ok: false, error: 'Key no válida.' });
   }
 
   if (license.status === 'revoked') {
-    logAttempt(prefix, deviceId, ip, 'revoked');
+    await logAttempt(prefix, deviceId, ip, 'revoked');
     return res.status(403).json({ ok: false, error: 'Esta key ha sido revocada.' });
   }
 
   if (license.status === 'active') {
     if (license.device_id && license.device_id !== deviceId) {
-      logAttempt(prefix, deviceId, ip, 'device_mismatch');
+      await logAttempt(prefix, deviceId, ip, 'device_mismatch');
       return res.status(409).json({
         ok: false,
         error: 'Esta key ya está activada en otro dispositivo. Contacta con soporte si crees que es un error.',
@@ -49,13 +49,13 @@ router.post('/activate', (req, res) => {
     // Mismo dispositivo reactivando: solo re-emitir token
   } else {
     // status === 'unused' -> activar ahora
-    db.prepare(
+    await db.prepare(
       `UPDATE licenses SET status = 'active', device_id = ?, activated_at = datetime('now') WHERE id = ?`
     ).run(deviceId, license.id);
   }
 
   // Crea la fila de stats por defecto la primera vez que se activa esta licencia
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(license.id);
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(license.id);
 
   const token = jwt.sign(
     { licenseId: license.id, deviceId, prefix },
@@ -63,19 +63,19 @@ router.post('/activate', (req, res) => {
     { expiresIn: '180d' }
   );
 
-  logAttempt(prefix, deviceId, ip, 'activated');
+  await logAttempt(prefix, deviceId, ip, 'activated');
   return res.json({ ok: true, token });
 });
 
 // Middleware: valida el token de licencia en cada petición protegida
-function requireToken(req, res, next) {
+async function requireToken(req, res, next) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return res.status(401).json({ ok: false, error: 'Falta token de licencia.' });
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const license = db.prepare('SELECT * FROM licenses WHERE id = ?').get(payload.licenseId);
+    const license = await db.prepare('SELECT * FROM licenses WHERE id = ?').get(payload.licenseId);
 
     if (!license || license.status !== 'active') {
       return res.status(403).json({ ok: false, error: 'Licencia no activa.' });
@@ -100,8 +100,8 @@ router.post('/validate', requireToken, (req, res) => {
 // GET /api/game/manifest  (público, sin token) -> última versión publicada
 // No requiere autenticación: solo expone nombres de archivo, tamaños y checksums
 // para que el launcher pueda comprobar actualizaciones antes de tener una licencia activa.
-router.get('/manifest', (req, res) => {
-  const release = db
+router.get('/manifest', async (req, res) => {
+  const release = await db
     .prepare('SELECT * FROM releases ORDER BY id DESC LIMIT 1')
     .get();
 

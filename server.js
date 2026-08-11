@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
-const { ensureSchema } = require('./db/pg');
+require('./lib/asyncErrors'); // debe ir antes de requerir cualquier routes/*.js
+const { pool } = require('./db/pg');
+const { ensureSchema } = require('./db/schema');
 const { ensureAdminAuthSchema } = require('./lib/adminAuth');
 const { startShopWatcher } = require('./lib/shopWatcher');
 const authRoutes = require('./routes/auth');
@@ -60,11 +62,20 @@ app.get('/', (req, res) => {
   res.json({ ok: true, service: 'pilla-pilla-server' });
 });
 
+// Error handler global: aquí acaban los errores de los handlers async que
+// rechazan su Promise (ver lib/asyncErrors.js) y cualquier next(err) manual.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error('Error no capturado en una ruta:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ ok: false, error: 'Error interno del servidor.' });
+});
+
 const PORT = process.env.PORT || 3000;
 
 async function start() {
   try {
-    await ensureSchema();
+    await ensureSchema(pool);
     await ensureAdminAuthSchema();
   } catch (err) {
     console.error('Error preparando el esquema de Postgres:', err);

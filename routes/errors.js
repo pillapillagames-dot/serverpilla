@@ -32,7 +32,7 @@ function checkRateLimit(licenseId) {
 // del login, el cliente puede omitir el token y el servidor lo acepta igual
 // pero sin asociar license_id (ver rama pública abajo).
 // ---------------------------------------------------------------------------
-router.post('/report', requireToken, (req, res) => {
+router.post('/report', requireToken, async (req, res) => {
   const licenseId = req.license.id;
 
   if (!checkRateLimit(licenseId)) {
@@ -54,7 +54,7 @@ router.post('/report', requireToken, (req, res) => {
 
   const safeLevel = ['error', 'fatal'].includes(level) ? level : 'error';
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO error_logs (license_id, level, message, stack, context, app_version, platform)
      VALUES (?, ?, ?, ?, ?, ?, ?)`
   ).run(
@@ -64,7 +64,7 @@ router.post('/report', requireToken, (req, res) => {
     stack ? String(stack).slice(0, 5000) : null,
     context ? String(context).slice(0, 200) : null,
     app_version ? String(app_version).slice(0, 50) : null,
-    platform ? String(platform).slice(0, 50) : null,
+    platform ? String(platform).slice(0, 50) : null
   );
 
   res.json({ ok: true });

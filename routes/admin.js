@@ -107,7 +107,7 @@ const SKIN_NAMES = [
 // ---------------------------------------------------------------------------
 // POST /api/admin/keys/generate
 // ---------------------------------------------------------------------------
-router.post('/keys/generate', (req, res) => {
+router.post('/keys/generate', async (req, res) => {
   const count = Math.min(parseInt(req.body?.count, 10) || 1, 500);
   const notes = req.body?.notes || null;
   const customerEmail = req.body?.customerEmail || null;
@@ -117,29 +117,30 @@ router.post('/keys/generate', (req, res) => {
   );
 
   const generated = [];
-  const tx = db.transaction(() => {
+  const tx = db.transaction(async () => {
     for (let i = 0; i < count; i++) {
       const plain = generateKey();
-      insert.run(hashKey(plain), prefixOf(plain), notes, customerEmail);
+      // eslint-disable-next-line no-await-in-loop
+      await insert.run(hashKey(plain), prefixOf(plain), notes, customerEmail);
       generated.push(plain);
     }
   });
-  tx();
+  await tx();
 
   logAudit(req, 'keys.generate', null, { count, notes, customerEmail }).catch(console.error);
   res.json({ ok: true, keys: generated });
 });
 
 // GET /api/admin/keys
-router.get('/keys', (req, res) => {
+router.get('/keys', async (req, res) => {
   const { status, limit } = req.query;
   let rows;
   if (status) {
-    rows = db
+    rows = await db
       .prepare('SELECT id, key_prefix, status, device_id, customer_email, created_at, activated_at, revoked_at FROM licenses WHERE status = ? ORDER BY id DESC LIMIT ?')
       .all(status, parseInt(limit, 10) || 100);
   } else {
-    rows = db
+    rows = await db
       .prepare('SELECT id, key_prefix, status, device_id, customer_email, created_at, activated_at, revoked_at FROM licenses ORDER BY id DESC LIMIT ?')
       .all(parseInt(limit, 10) || 100);
   }
@@ -147,8 +148,8 @@ router.get('/keys', (req, res) => {
 });
 
 // POST /api/admin/keys/:id/revoke
-router.post('/keys/:id/revoke', (req, res) => {
-  const info = db
+router.post('/keys/:id/revoke', async (req, res) => {
+  const info = await db
     .prepare(`UPDATE licenses SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?`)
     .run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Key no encontrada.' });
@@ -157,8 +158,8 @@ router.post('/keys/:id/revoke', (req, res) => {
 });
 
 // POST /api/admin/keys/:id/reset-device
-router.post('/keys/:id/reset-device', (req, res) => {
-  const info = db.prepare('UPDATE licenses SET device_id = NULL WHERE id = ?').run(req.params.id);
+router.post('/keys/:id/reset-device', async (req, res) => {
+  const info = await db.prepare('UPDATE licenses SET device_id = NULL WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Key no encontrada.' });
   logAudit(req, 'keys.reset-device', `licenses:${req.params.id}`).catch(console.error);
   res.json({ ok: true });
@@ -167,9 +168,9 @@ router.post('/keys/:id/reset-device', (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/admin/purchases
 // ---------------------------------------------------------------------------
-router.get('/purchases', (req, res) => {
+router.get('/purchases', async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
-  const rows = db
+  const rows = await db
     .prepare(
       `SELECT p.id, p.item_type, p.item_index, p.price, p.coins_after, p.created_at,
               l.key_prefix, l.customer_email,
@@ -182,7 +183,7 @@ router.get('/purchases', (req, res) => {
     )
     .all(limit);
 
-  const totals = db
+  const totals = await db
     .prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(price), 0) AS coinsSpent FROM purchases`)
     .get();
 
@@ -196,12 +197,12 @@ router.get('/online', (req, res) => {
   const windowSeconds = parseInt(req.query.windowSeconds, 10) || 300;
   const online = listOnline(windowSeconds * 1000);
 
-  const players = online.map(({ deviceId, lastSeenSecondsAgo }) => {
-    const license = db
+  const players = online.map(async ({ deviceId, lastSeenSecondsAgo }) => {
+    const license = await db
       .prepare('SELECT id, key_prefix, customer_email, status FROM licenses WHERE device_id = ?')
       .get(deviceId);
     const stats = license
-      ? db
+      ? await db
           .prepare('SELECT username, level, elo, rank FROM player_stats WHERE license_id = ?')
           .get(license.id)
       : null;
@@ -225,30 +226,28 @@ router.get('/online', (req, res) => {
 // ---------------------------------------------------------------------------
 // Releases
 // ---------------------------------------------------------------------------
-router.post('/releases', (req, res) => {
+router.post('/releases', async (req, res) => {
   const { version, manifest, notes } = req.body || {};
   if (!version || !manifest) {
     return res.status(400).json({ ok: false, error: 'Faltan version o manifest.' });
   }
   try {
-    db.prepare('INSERT INTO releases (version, manifest_json, notes) VALUES (?, ?, ?)').run(
-      version, JSON.stringify(manifest), notes || null
-    );
+    await db.prepare('INSERT INTO releases (version, manifest_json, notes) VALUES (?, ?, ?)').run(version, JSON.stringify(manifest), notes || null);
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ ok: false, error: 'Esa versión ya existe o hubo un error: ' + err.message });
   }
 });
 
-router.get('/releases', (req, res) => {
-  const rows = db.prepare('SELECT id, version, published_at, notes FROM releases ORDER BY id DESC').all();
+router.get('/releases', async (req, res) => {
+  const rows = await db.prepare('SELECT id, version, published_at, notes FROM releases ORDER BY id DESC').all();
   res.json({ ok: true, releases: rows });
 });
 
 // ---------------------------------------------------------------------------
 // News
 // ---------------------------------------------------------------------------
-router.post('/news', (req, res) => {
+router.post('/news', async (req, res) => {
   const { title, body: newsBody, date } = req.body || {};
   if (!title || !newsBody) {
     return res.status(400).json({ ok: false, error: 'Faltan title o body.' });
@@ -256,18 +255,18 @@ router.post('/news', (req, res) => {
   const stmt = date
     ? db.prepare('INSERT INTO news (title, body, date) VALUES (?, ?, ?)')
     : db.prepare('INSERT INTO news (title, body) VALUES (?, ?)');
-  const info = date ? stmt.run(title, newsBody, date) : stmt.run(title, newsBody);
+  const info = date ? await stmt.run(title, newsBody, date) : await stmt.run(title, newsBody);
   logAudit(req, 'news.create', `news:${info.lastInsertRowid}`, { title }).catch(console.error);
   res.json({ ok: true, id: info.lastInsertRowid });
 });
 
-router.get('/news', (req, res) => {
-  const rows = db.prepare('SELECT id, title, body, date FROM news ORDER BY id DESC').all();
+router.get('/news', async (req, res) => {
+  const rows = await db.prepare('SELECT id, title, body, date FROM news ORDER BY id DESC').all();
   res.json({ ok: true, news: rows });
 });
 
-router.delete('/news/:id', (req, res) => {
-  const info = db.prepare('DELETE FROM news WHERE id = ?').run(req.params.id);
+router.delete('/news/:id', async (req, res) => {
+  const info = await db.prepare('DELETE FROM news WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Novedad no encontrada.' });
   logAudit(req, 'news.delete', `news:${req.params.id}`).catch(console.error);
   res.json({ ok: true });
@@ -356,14 +355,14 @@ router.post('/game-keys/:id/revoke', async (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/admin/players?search=...&limit=200
 // ---------------------------------------------------------------------------
-router.get('/players', (req, res) => {
+router.get('/players', async (req, res) => {
   const search = (req.query.search || '').trim();
   const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
 
   let rows;
   if (search) {
     const like = `%${search}%`;
-    rows = db.prepare(
+    rows = await db.prepare(
       `SELECT l.id AS licenseId, l.key_prefix, l.customer_email, l.status,
               ps.username, ps.level, ps.elo, ps.coins, ps.training_coins AS trainingCoins, ps.updated_at
        FROM licenses l
@@ -373,7 +372,7 @@ router.get('/players', (req, res) => {
        LIMIT ?`
     ).all(like, like, like, limit);
   } else {
-    rows = db.prepare(
+    rows = await db.prepare(
       `SELECT l.id AS licenseId, l.key_prefix, l.customer_email, l.status,
               ps.username, ps.level, ps.elo, ps.coins, ps.training_coins AS trainingCoins, ps.updated_at
        FROM licenses l
@@ -389,7 +388,7 @@ router.get('/players', (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/admin/players/:id/coins   body: { coins }
 // ---------------------------------------------------------------------------
-router.post('/players/:id/coins', (req, res) => {
+router.post('/players/:id/coins', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const coins = parseInt(req.body?.coins, 10);
 
@@ -397,8 +396,8 @@ router.post('/players/:id/coins', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Cantidad de monedas inválida.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  const info = db
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = await db
     .prepare(`UPDATE player_stats SET coins = ?, updated_at = datetime('now') WHERE license_id = ?`)
     .run(coins, licenseId);
 
@@ -410,7 +409,7 @@ router.post('/players/:id/coins', (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/admin/players/:id/training-coins   body: { trainingCoins }
 // ---------------------------------------------------------------------------
-router.post('/players/:id/training-coins', (req, res) => {
+router.post('/players/:id/training-coins', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const trainingCoins = parseInt(req.body?.trainingCoins, 10);
 
@@ -418,8 +417,8 @@ router.post('/players/:id/training-coins', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Cantidad de monedas de entrenamiento inválida.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  const info = db
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = await db
     .prepare(`UPDATE player_stats SET training_coins = ?, updated_at = datetime('now') WHERE license_id = ?`)
     .run(trainingCoins, licenseId);
 
@@ -432,7 +431,7 @@ router.post('/players/:id/training-coins', (req, res) => {
 // GET /api/admin/battlepass?search=...&limit=200
 // Estado del Pase de Batalla (temporada = mes actual) por jugador.
 // ---------------------------------------------------------------------------
-router.get('/battlepass', (req, res) => {
+router.get('/battlepass', async (req, res) => {
   const search = (req.query.search || '').trim();
   const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
   const cur = new Date().toISOString().slice(0, 7); // 'YYYY-MM', igual que currentMonthKey()
@@ -451,8 +450,8 @@ router.get('/battlepass', (req, res) => {
     LIMIT ?
   `;
   const rows = search
-    ? db.prepare(base).all(`%${search}%`, `%${search}%`, limit)
-    : db.prepare(base).all(limit);
+    ? await db.prepare(base).all(`%${search}%`, `%${search}%`, limit)
+    : await db.prepare(base).all(limit);
 
   const players = rows.map((r) => {
     const inSeason = r.battlePassMonth === cur;
@@ -483,12 +482,12 @@ router.get('/battlepass', (req, res) => {
 // Fuerza (o revoca) el Premium de la temporada actual a mano, al margen del
 // botón "Activar Premium" gratis que ya tiene el jugador en el juego.
 // ---------------------------------------------------------------------------
-router.post('/players/:id/battlepass-premium', (req, res) => {
+router.post('/players/:id/battlepass-premium', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const premium = !!req.body?.premium;
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  const info = db
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = await db
     .prepare(`UPDATE player_stats SET battle_pass_premium = ?, updated_at = datetime('now') WHERE license_id = ?`)
     .run(premium ? 1 : 0, licenseId);
 
@@ -500,10 +499,10 @@ router.post('/players/:id/battlepass-premium', (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/admin/players/:id/inventory
 // ---------------------------------------------------------------------------
-router.get('/players/:id/inventory', (req, res) => {
+router.get('/players/:id/inventory', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
 
-  const stats = db
+  const stats = await db
     .prepare('SELECT unlocked_skins FROM player_stats WHERE license_id = ?')
     .get(licenseId);
 
@@ -518,15 +517,15 @@ router.get('/players/:id/inventory', (req, res) => {
     owned: unlockedSkins.includes(index),
   }));
 
-  const furniture = db
+  const furniture = await db
     .prepare('SELECT item_id, purchased_at FROM player_house_furniture WHERE license_id = ?')
     .all(licenseId);
 
-  const pets = db
+  const pets = await db
     .prepare('SELECT pet_id, species_id, level, nickname, equipped FROM player_pets WHERE license_id = ?')
     .all(licenseId);
 
-  const gestures = db
+  const gestures = await db
     .prepare('SELECT gesture_id, purchased_at FROM player_gestures WHERE license_id = ?')
     .all(licenseId);
 
@@ -536,7 +535,7 @@ router.get('/players/:id/inventory', (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/admin/players/:id/skins   body: { skinIndex, owned }
 // ---------------------------------------------------------------------------
-router.post('/players/:id/skins', (req, res) => {
+router.post('/players/:id/skins', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const { skinIndex, owned } = req.body || {};
 
@@ -552,8 +551,8 @@ router.post('/players/:id/skins', (req, res) => {
     return res.status(400).json({ ok: false, error: 'La skin base no se puede quitar.' });
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  const row = db.prepare('SELECT unlocked_skins FROM player_stats WHERE license_id = ?').get(licenseId);
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const row = await db.prepare('SELECT unlocked_skins FROM player_stats WHERE license_id = ?').get(licenseId);
   if (!row) return res.status(404).json({ ok: false, error: 'Jugador no encontrado.' });
 
   let unlocked;
@@ -566,7 +565,7 @@ router.post('/players/:id/skins', (req, res) => {
     unlocked = unlocked.filter((i) => i !== skinIndex);
   }
 
-  db.prepare(
+  await db.prepare(
     `UPDATE player_stats SET unlocked_skins = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(JSON.stringify(unlocked), licenseId);
 
@@ -577,12 +576,12 @@ router.post('/players/:id/skins', (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/admin/matches
 // ---------------------------------------------------------------------------
-router.get('/matches', (req, res) => {
+router.get('/matches', async (req, res) => {
   const ALLOWED_SORTS = ['matches_played', 'wins', 'elo', 'best_survival_seconds', 'total_catches'];
   const sort = ALLOWED_SORTS.includes(req.query.sort) ? req.query.sort : 'matches_played';
   const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
 
-  const players = db.prepare(
+  const players = await db.prepare(
     `SELECT ps.license_id AS licenseId, ps.username, ps.level, ps.elo,
             ps.matches_played, ps.wins, ps.total_catches, ps.best_survival_seconds,
             l.key_prefix
@@ -593,7 +592,7 @@ router.get('/matches', (req, res) => {
      LIMIT ?`
   ).all(limit);
 
-  const totals = db
+  const totals = await db
     .prepare(`SELECT COALESCE(SUM(matches_played), 0) AS total FROM player_stats`)
     .get();
 
@@ -603,10 +602,10 @@ router.get('/matches', (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/admin/anticheat
 // ---------------------------------------------------------------------------
-router.get('/anticheat', (req, res) => {
+router.get('/anticheat', async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 150, 500);
 
-  const flags = db.prepare(
+  const flags = await db.prepare(
     `SELECT af.id, af.license_id, af.reason, af.field, af.created_at,
             l.key_prefix,
             ps.username
@@ -617,7 +616,7 @@ router.get('/anticheat', (req, res) => {
      LIMIT ?`
   ).all(limit);
 
-  const topOffenders = db.prepare(
+  const topOffenders = await db.prepare(
     `SELECT af.license_id, l.key_prefix, ps.username,
             COUNT(*) AS flagCount
      FROM anticheat_flags af
@@ -634,24 +633,24 @@ router.get('/anticheat', (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/admin/world  /  POST /api/admin/world
 // ---------------------------------------------------------------------------
-router.get('/world', (req, res) => {
-  const world = db.prepare('SELECT * FROM world_state WHERE id = 1').get();
+router.get('/world', async (req, res) => {
+  const world = await db.prepare('SELECT * FROM world_state WHERE id = 1').get();
   res.json({ ok: true, world });
 });
 
-router.post('/world', (req, res) => {
+router.post('/world', async (req, res) => {
   const maintenanceMode = req.body?.maintenanceMode ? 1 : 0;
   const maintenanceMessage = (req.body?.maintenanceMessage || '').toString().slice(0, 500);
   const bannerMessage = (req.body?.bannerMessage || '').toString().slice(0, 500);
 
-  db.prepare(
+  await db.prepare(
     `UPDATE world_state
      SET maintenance_mode = ?, maintenance_message = ?, banner_message = ?,
          updated_at = datetime('now')
      WHERE id = 1`
   ).run(maintenanceMode, maintenanceMessage, bannerMessage);
 
-  const world = db.prepare('SELECT * FROM world_state WHERE id = 1').get();
+  const world = await db.prepare('SELECT * FROM world_state WHERE id = 1').get();
   logAudit(req, 'world.update', 'world_state:1', { maintenanceMode: !!maintenanceMode, bannerMessage }).catch(console.error);
   res.json({ ok: true, world });
 });
@@ -661,16 +660,16 @@ router.post('/world', (req, res) => {
 // PUT /api/admin/shop/packages/:id   body: { coins, priceUsd }
 // GET /api/admin/shop/orders?status=...
 // ---------------------------------------------------------------------------
-router.get('/shop/packages', (req, res) => {
-  const packages = db.prepare(
+router.get('/shop/packages', async (req, res) => {
+  const packages = await db.prepare(
     'SELECT id, coins, price_usd AS priceUsd FROM shop_packages ORDER BY sort_order ASC, id ASC'
   ).all();
   res.json({ ok: true, packages });
 });
 
-router.put('/shop/packages/:id', (req, res) => {
+router.put('/shop/packages/:id', async (req, res) => {
   const { id } = req.params;
-  const existing = db.prepare('SELECT * FROM shop_packages WHERE id = ?').get(id);
+  const existing = await db.prepare('SELECT * FROM shop_packages WHERE id = ?').get(id);
   if (!existing) {
     return res.status(404).json({ ok: false, error: 'Paquete no encontrado.' });
   }
@@ -685,22 +684,22 @@ router.put('/shop/packages/:id', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Precio inválido.' });
   }
 
-  db.prepare(
+  await db.prepare(
     `UPDATE shop_packages SET coins = ?, price_usd = ?, updated_at = datetime('now') WHERE id = ?`
   ).run(coins, priceUsd, id);
 
-  const updated = db.prepare('SELECT id, coins, price_usd AS priceUsd FROM shop_packages WHERE id = ?').get(id);
+  const updated = await db.prepare('SELECT id, coins, price_usd AS priceUsd FROM shop_packages WHERE id = ?').get(id);
   logAudit(req, 'shop.update-package', `shop_packages:${id}`, { coins, priceUsd }).catch(console.error);
   res.json({ ok: true, package: updated });
 });
 
-router.get('/shop/orders', (req, res) => {
+router.get('/shop/orders', async (req, res) => {
   const { status } = req.query;
   const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
 
   let rows;
   if (status) {
-    rows = db.prepare(
+    rows = await db.prepare(
       `SELECT po.id, po.package_id, po.coins, po.price_usd, po.amount_sol,
               po.status, po.created_at, po.confirmed_at,
               l.key_prefix, l.customer_email,
@@ -712,7 +711,7 @@ router.get('/shop/orders', (req, res) => {
        ORDER BY po.id DESC LIMIT ?`
     ).all(status, limit);
   } else {
-    rows = db.prepare(
+    rows = await db.prepare(
       `SELECT po.id, po.package_id, po.coins, po.price_usd, po.amount_sol,
               po.status, po.created_at, po.confirmed_at,
               l.key_prefix, l.customer_email,
@@ -724,7 +723,7 @@ router.get('/shop/orders', (req, res) => {
     ).all(limit);
   }
 
-  const totals = db.prepare(
+  const totals = await db.prepare(
     `SELECT COUNT(*) AS total,
             COALESCE(SUM(CASE WHEN status = 'confirmed' THEN coins ELSE 0 END), 0) AS coinsSold,
             COUNT(CASE WHEN status = 'confirmed' THEN 1 END) AS paidCount
@@ -737,7 +736,7 @@ router.get('/shop/orders', (req, res) => {
 // ---------------------------------------------------------------------------
 // Logs de errores
 // ---------------------------------------------------------------------------
-router.get('/error-logs', (req, res) => {
+router.get('/error-logs', async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 150, 500);
   const conditions = [];
   const params = [];
@@ -757,7 +756,7 @@ router.get('/error-logs', (req, res) => {
 
   const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
-  const logs = db.prepare(
+  const logs = await db.prepare(
     `SELECT el.id, el.level, el.message, el.stack, el.context,
             el.app_version, el.platform, el.resolved, el.created_at,
             l.key_prefix, l.customer_email,
@@ -770,7 +769,7 @@ router.get('/error-logs', (req, res) => {
      LIMIT ?`
   ).all(...params, limit);
 
-  const totals = db.prepare(
+  const totals = await db.prepare(
     `SELECT COUNT(*) AS total,
             COUNT(CASE WHEN resolved = 0 THEN 1 END) AS unresolved,
             COUNT(CASE WHEN level = 'fatal' THEN 1 END) AS fatalCount
@@ -780,26 +779,26 @@ router.get('/error-logs', (req, res) => {
   res.json({ ok: true, logs, totals });
 });
 
-router.post('/error-logs/clear-resolved', (req, res) => {
-  const info = db.prepare('DELETE FROM error_logs WHERE resolved = 1').run();
+router.post('/error-logs/clear-resolved', async (req, res) => {
+  const info = await db.prepare('DELETE FROM error_logs WHERE resolved = 1').run();
   logAudit(req, 'error-logs.clear-resolved', null, { deleted: info.changes }).catch(console.error);
   res.json({ ok: true, deleted: info.changes });
 });
 
-router.post('/error-logs/:id/resolve', (req, res) => {
-  const info = db.prepare('UPDATE error_logs SET resolved = 1 WHERE id = ?').run(req.params.id);
+router.post('/error-logs/:id/resolve', async (req, res) => {
+  const info = await db.prepare('UPDATE error_logs SET resolved = 1 WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Log no encontrado.' });
   res.json({ ok: true });
 });
 
-router.post('/error-logs/:id/reopen', (req, res) => {
-  const info = db.prepare('UPDATE error_logs SET resolved = 0 WHERE id = ?').run(req.params.id);
+router.post('/error-logs/:id/reopen', async (req, res) => {
+  const info = await db.prepare('UPDATE error_logs SET resolved = 0 WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Log no encontrado.' });
   res.json({ ok: true });
 });
 
-router.delete('/error-logs/:id', (req, res) => {
-  const info = db.prepare('DELETE FROM error_logs WHERE id = ?').run(req.params.id);
+router.delete('/error-logs/:id', async (req, res) => {
+  const info = await db.prepare('DELETE FROM error_logs WHERE id = ?').run(req.params.id);
   if (info.changes === 0) return res.status(404).json({ ok: false, error: 'Log no encontrado.' });
   logAudit(req, 'error-logs.delete', `error_logs:${req.params.id}`).catch(console.error);
   res.json({ ok: true });
@@ -811,7 +810,7 @@ router.delete('/error-logs/:id', (req, res) => {
 
 // GET /api/admin/guilds?search=texto
 // Lista de clanes con nombre, tag, líder, nº de miembros y banco de monedas.
-router.get('/guilds', (req, res) => {
+router.get('/guilds', async (req, res) => {
   const search = (req.query.search || '').trim();
   const clauses = [];
   const params = [];
@@ -821,7 +820,7 @@ router.get('/guilds', (req, res) => {
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-  const rows = db
+  const rows = await db
     .prepare(
       `SELECT g.id, g.name, g.tag, g.description, g.leader_license_id, g.level, g.xp,
               g.bank_coins, g.created_at,
@@ -838,11 +837,11 @@ router.get('/guilds', (req, res) => {
 });
 
 // GET /api/admin/guilds/:id  -> detalle con lista de miembros y roles
-router.get('/guilds/:id', (req, res) => {
-  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(req.params.id);
+router.get('/guilds/:id', async (req, res) => {
+  const guild = await db.prepare('SELECT * FROM guilds WHERE id = ?').get(req.params.id);
   if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
 
-  const members = db
+  const members = await db
     .prepare(
       `SELECT gm.license_id AS licenseId, gm.joined_at AS joinedAt, gm.role AS role,
               COALESCE(ps.username, 'Jugador' || gm.license_id) AS username,
@@ -874,26 +873,26 @@ router.get('/guilds/:id', (req, res) => {
 });
 
 // POST /api/admin/guilds/:id/dissolve  -> disuelve el clan (borra miembros y mensajes)
-router.post('/guilds/:id/dissolve', (req, res) => {
-  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(req.params.id);
+router.post('/guilds/:id/dissolve', async (req, res) => {
+  const guild = await db.prepare('SELECT * FROM guilds WHERE id = ?').get(req.params.id);
   if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
 
-  const dissolve = db.transaction(() => {
-    db.prepare('DELETE FROM guild_members WHERE guild_id = ?').run(guild.id);
-    db.prepare('DELETE FROM guild_messages WHERE guild_id = ?').run(guild.id);
-    db.prepare('DELETE FROM guilds WHERE id = ?').run(guild.id);
+  const dissolve = db.transaction(async () => {
+    await db.prepare('DELETE FROM guild_members WHERE guild_id = ?').run(guild.id);
+    await db.prepare('DELETE FROM guild_messages WHERE guild_id = ?').run(guild.id);
+    await db.prepare('DELETE FROM guilds WHERE id = ?').run(guild.id);
   });
-  dissolve();
+  await dissolve();
 
   logAudit(req, 'guilds.dissolve', `guilds:${guild.id}`, { name: guild.name, tag: guild.tag }).catch(console.error);
   res.json({ ok: true });
 });
 
 // POST /api/admin/guilds/:id/kick/:licenseId  -> expulsa a un miembro (el líder no puede expulsarse a sí mismo por aquí; usa dissolve)
-router.post('/guilds/:id/kick/:licenseId', (req, res) => {
+router.post('/guilds/:id/kick/:licenseId', async (req, res) => {
   const guildId = Number(req.params.id);
   const licenseId = Number(req.params.licenseId);
-  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(guildId);
+  const guild = await db.prepare('SELECT * FROM guilds WHERE id = ?').get(guildId);
   if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
 
   if (guild.leader_license_id === licenseId) {
@@ -903,16 +902,16 @@ router.post('/guilds/:id/kick/:licenseId', (req, res) => {
     });
   }
 
-  const member = db
+  const member = await db
     .prepare('SELECT * FROM guild_members WHERE guild_id = ? AND license_id = ?')
     .get(guildId, licenseId);
   if (!member) return res.status(404).json({ ok: false, error: 'Ese jugador no pertenece a este clan.' });
 
-  const username = db.prepare('SELECT username FROM player_stats WHERE license_id = ?').get(licenseId)?.username
+  const username = (await db.prepare('SELECT username FROM player_stats WHERE license_id = ?').get(licenseId))?.username
     || `Jugador${licenseId}`;
 
-  db.prepare('DELETE FROM guild_members WHERE guild_id = ? AND license_id = ?').run(guildId, licenseId);
-  db.prepare(
+  await db.prepare('DELETE FROM guild_members WHERE guild_id = ? AND license_id = ?').run(guildId, licenseId);
+  await db.prepare(
     `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
   ).run(guildId, `${username} fue expulsado del clan por un administrador.`);
 
@@ -921,7 +920,7 @@ router.post('/guilds/:id/kick/:licenseId', (req, res) => {
 });
 
 // POST /api/admin/guilds/:id/bank-coins  body: { bankCoins }  -> fija el banco del clan
-router.post('/guilds/:id/bank-coins', (req, res) => {
+router.post('/guilds/:id/bank-coins', async (req, res) => {
   const guildId = Number(req.params.id);
   const bankCoins = parseInt(req.body?.bankCoins, 10);
 
@@ -929,10 +928,10 @@ router.post('/guilds/:id/bank-coins', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Cantidad de banco inválida.' });
   }
 
-  const guild = db.prepare('SELECT * FROM guilds WHERE id = ?').get(guildId);
+  const guild = await db.prepare('SELECT * FROM guilds WHERE id = ?').get(guildId);
   if (!guild) return res.status(404).json({ ok: false, error: 'Clan no encontrado.' });
 
-  db.prepare('UPDATE guilds SET bank_coins = ? WHERE id = ?').run(bankCoins, guildId);
+  await db.prepare('UPDATE guilds SET bank_coins = ? WHERE id = ?').run(bankCoins, guildId);
 
   logAudit(req, 'guilds.set-bank-coins', `guilds:${guildId}`, { bankCoins }).catch(console.error);
   res.json({ ok: true, bankCoins });
@@ -976,7 +975,7 @@ router.get('/auth/me', (req, res) => {
 // body: { coins, priceUsd, sortOrder? }
 // El PUT existente solo editaba; este crea con ID generado automáticamente.
 // ---------------------------------------------------------------------------
-router.post('/shop/packages', (req, res) => {
+router.post('/shop/packages', async (req, res) => {
   const { coins, priceUsd, sortOrder = 0 } = req.body || {};
 
   if (!Number.isInteger(coins) || coins <= 0) {
@@ -989,11 +988,11 @@ router.post('/shop/packages', (req, res) => {
   // ID generado a partir de coins para mantener convención existente (p500, p1200…)
   const id = `p${coins}_${Date.now()}`;
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO shop_packages (id, coins, price_usd, sort_order) VALUES (?, ?, ?, ?)`
   ).run(id, coins, priceUsd, sortOrder);
 
-  const created = db.prepare(
+  const created = await db.prepare(
     'SELECT id, coins, price_usd AS priceUsd, sort_order AS sortOrder FROM shop_packages WHERE id = ?'
   ).get(id);
 
@@ -1004,13 +1003,13 @@ router.post('/shop/packages', (req, res) => {
 // ---------------------------------------------------------------------------
 // DELETE /api/admin/shop/packages/:id — Eliminar paquete
 // ---------------------------------------------------------------------------
-router.delete('/shop/packages/:id', (req, res) => {
+router.delete('/shop/packages/:id', async (req, res) => {
   const { id } = req.params;
-  const existing = db.prepare('SELECT * FROM shop_packages WHERE id = ?').get(id);
+  const existing = await db.prepare('SELECT * FROM shop_packages WHERE id = ?').get(id);
   if (!existing) {
     return res.status(404).json({ ok: false, error: 'Paquete no encontrado.' });
   }
-  db.prepare('DELETE FROM shop_packages WHERE id = ?').run(id);
+  await db.prepare('DELETE FROM shop_packages WHERE id = ?').run(id);
   logAudit(req, 'shop.delete-package', `shop_packages:${id}`, { id }).catch(console.error);
   res.json({ ok: true });
 });
@@ -1021,18 +1020,16 @@ router.delete('/shop/packages/:id', (req, res) => {
 // Actualiza la columna treasury_wallet de world_state (fila única).
 // El campo se añade automáticamente si no existe todavía (migración inline).
 // ---------------------------------------------------------------------------
-router.post('/shop/wallet', (req, res) => {
+router.post('/shop/wallet', async (req, res) => {
   const { wallet } = req.body || {};
   if (!wallet || typeof wallet !== 'string' || wallet.length < 20) {
     return res.status(400).json({ ok: false, error: 'Dirección de wallet inválida.' });
   }
 
-  // Migración inline: añadir columna si no existe (SQLite no lanza error si ya existe gracias al try/catch)
-  try {
-    db.exec('ALTER TABLE world_state ADD COLUMN treasury_wallet TEXT NOT NULL DEFAULT ""');
-  } catch (_) { /* columna ya existe, ignorar */ }
+  // La columna treasury_wallet ya la garantiza db/schema.js en cada arranque
+  // (ALTER TABLE ... ADD COLUMN IF NOT EXISTS), no hace falta migrarla aquí.
 
-  db.prepare(
+  await db.prepare(
     `UPDATE world_state SET treasury_wallet = ?, updated_at = datetime('now') WHERE id = 1`
   ).run(wallet);
 
@@ -1045,17 +1042,14 @@ router.post('/shop/wallet', (req, res) => {
 // body: { title: "Leyenda" }  o  { title: null }
 // Guarda en la columna active_title de player_stats (migración inline).
 // ---------------------------------------------------------------------------
-router.post('/players/:id/title', (req, res) => {
+router.post('/players/:id/title', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const title = req.body?.title ?? null; // null = retirar título
 
-  // Migración inline
-  try {
-    db.exec('ALTER TABLE player_stats ADD COLUMN active_title TEXT');
-  } catch (_) {}
+  // La columna active_title ya la garantiza db/schema.js.
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  const info = db.prepare(
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = await db.prepare(
     `UPDATE player_stats SET active_title = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(title, licenseId);
 
@@ -1070,16 +1064,14 @@ router.post('/players/:id/title', (req, res) => {
 // body: { unlocked: true|false }
 // Usa la columna story_mode_unlocked de player_stats (migración inline).
 // ---------------------------------------------------------------------------
-router.post('/players/:id/story-dlc', (req, res) => {
+router.post('/players/:id/story-dlc', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const unlocked = Boolean(req.body?.unlocked);
 
-  try {
-    db.exec('ALTER TABLE player_stats ADD COLUMN story_mode_unlocked INTEGER NOT NULL DEFAULT 0');
-  } catch (_) {}
+  // La columna story_mode_unlocked ya la garantiza db/schema.js.
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
-  const info = db.prepare(
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(licenseId);
+  const info = await db.prepare(
     `UPDATE player_stats SET story_mode_unlocked = ?, updated_at = datetime('now') WHERE license_id = ?`
   ).run(unlocked ? 1 : 0, licenseId);
 
@@ -1093,7 +1085,7 @@ router.post('/players/:id/story-dlc', (req, res) => {
 // POST /api/admin/players/:id/pets/grant — Otorgar mascota
 // body: { species_id, nickname? }
 // ---------------------------------------------------------------------------
-router.post('/players/:id/pets/grant', (req, res) => {
+router.post('/players/:id/pets/grant', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const { species_id, nickname = null } = req.body || {};
 
@@ -1102,7 +1094,7 @@ router.post('/players/:id/pets/grant', (req, res) => {
   }
 
   const petId = `${species_id}_${Date.now()}`;
-  db.prepare(
+  await db.prepare(
     `INSERT INTO player_pets (license_id, pet_id, species_id, nickname, level, equipped)
      VALUES (?, ?, ?, ?, 1, 0)`
   ).run(licenseId, petId, species_id, nickname);
@@ -1114,11 +1106,11 @@ router.post('/players/:id/pets/grant', (req, res) => {
 // ---------------------------------------------------------------------------
 // DELETE /api/admin/players/:id/pets/:petId — Retirar mascota
 // ---------------------------------------------------------------------------
-router.delete('/players/:id/pets/:petId', (req, res) => {
+router.delete('/players/:id/pets/:petId', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const { petId } = req.params;
 
-  const info = db.prepare(
+  const info = await db.prepare(
     'DELETE FROM player_pets WHERE license_id = ? AND pet_id = ?'
   ).run(licenseId, petId);
 
@@ -1131,7 +1123,7 @@ router.delete('/players/:id/pets/:petId', (req, res) => {
 // POST /api/admin/players/:id/gestures/grant — Otorgar gesto
 // body: { gesture_id }
 // ---------------------------------------------------------------------------
-router.post('/players/:id/gestures/grant', (req, res) => {
+router.post('/players/:id/gestures/grant', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const gestureId = String(req.body?.gesture_id ?? '');
 
@@ -1140,12 +1132,12 @@ router.post('/players/:id/gestures/grant', (req, res) => {
   }
 
   // Ignorar si ya lo tiene
-  const existing = db.prepare(
+  const existing = await db.prepare(
     'SELECT id FROM player_gestures WHERE license_id = ? AND gesture_id = ?'
   ).get(licenseId, gestureId);
 
   if (!existing) {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO player_gestures (license_id, gesture_id) VALUES (?, ?)`
     ).run(licenseId, gestureId);
     logAudit(req, 'players.grant-gesture', `licenses:${licenseId}`, { gestureId }).catch(console.error);
@@ -1157,11 +1149,11 @@ router.post('/players/:id/gestures/grant', (req, res) => {
 // ---------------------------------------------------------------------------
 // DELETE /api/admin/players/:id/gestures/:gestureId — Retirar gesto
 // ---------------------------------------------------------------------------
-router.delete('/players/:id/gestures/:gestureId', (req, res) => {
+router.delete('/players/:id/gestures/:gestureId', async (req, res) => {
   const licenseId = parseInt(req.params.id, 10);
   const { gestureId } = req.params;
 
-  const info = db.prepare(
+  const info = await db.prepare(
     'DELETE FROM player_gestures WHERE license_id = ? AND gesture_id = ?'
   ).run(licenseId, gestureId);
 
@@ -1179,24 +1171,9 @@ router.delete('/players/:id/gestures/:gestureId', (req, res) => {
 // sync. El cliente Godot puede llamar a GET /api/game/status para ver si
 // hay un broadcast activo.
 // ---------------------------------------------------------------------------
-(() => {
-  // Migración inline de tabla de broadcasts
-  try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS broadcasts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        message TEXT NOT NULL,
-        type TEXT NOT NULL DEFAULT 'info',
-        duration INTEGER NOT NULL DEFAULT 10,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        expires_at TEXT NOT NULL DEFAULT (datetime('now', '+60 seconds'))
-      );
-      CREATE INDEX IF NOT EXISTS idx_broadcasts_expires ON broadcasts(expires_at DESC);
-    `);
-  } catch (_) {}
-})();
+// La tabla broadcasts (y su índice) ya la crea db/schema.js en el arranque.
 
-router.post('/broadcast', (req, res) => {
+router.post('/broadcast', async (req, res) => {
   const { message, duration = 10, type = 'info' } = req.body || {};
   if (!message || typeof message !== 'string' || message.trim() === '') {
     return res.status(400).json({ ok: false, error: 'El mensaje es obligatorio.' });
@@ -1205,21 +1182,21 @@ router.post('/broadcast', (req, res) => {
   const safeType = validTypes.includes(type) ? type : 'info';
   const safeDuration = Math.min(Math.max(parseInt(duration, 10) || 10, 1), 300);
 
-  const info = db.prepare(
+  const info = await db.prepare(
     `INSERT INTO broadcasts (message, type, duration, expires_at)
      VALUES (?, ?, ?, datetime('now', '+' || ? || ' seconds'))`
   ).run(message.trim(), safeType, safeDuration, safeDuration + 30);
 
   // Limpiar broadcasts expirados (mantener solo últimos 50)
-  db.prepare(`DELETE FROM broadcasts WHERE id NOT IN (SELECT id FROM broadcasts ORDER BY id DESC LIMIT 50)`).run();
+  await db.prepare(`DELETE FROM broadcasts WHERE id NOT IN (SELECT id FROM broadcasts ORDER BY id DESC LIMIT 50)`).run();
 
   logAudit(req, 'broadcast.send', `broadcasts:${info.lastInsertRowid}`, { message, type, duration }).catch(console.error);
   res.json({ ok: true, id: info.lastInsertRowid, message, type, duration: safeDuration });
 });
 
 // GET /api/admin/broadcast/history — Historial de broadcasts recientes
-router.get('/broadcast/history', (req, res) => {
-  const rows = db.prepare(
+router.get('/broadcast/history', async (req, res) => {
+  const rows = await db.prepare(
     `SELECT id, message, type, duration, created_at, expires_at FROM broadcasts ORDER BY id DESC LIMIT 20`
   ).all();
   res.json({ ok: true, broadcasts: rows });
@@ -1234,46 +1211,43 @@ router.get('/broadcast/history', (req, res) => {
 // battlepass_claimed_tiers de todos los jugadores. La columna seasonMonth
 // no existe en player_stats (viene calculada como el mes actual en el GET
 // /api/admin/battlepass). Para persistirla se usa world_state.
-router.post('/battlepass/advance-season', requireRole('owner'), (req, res) => {
+router.post('/battlepass/advance-season', requireRole('owner'), async (req, res) => {
   const { newSeasonMonth } = req.body || {};
   if (!newSeasonMonth || !/^\d{4}-\d{2}$/.test(newSeasonMonth)) {
     return res.status(400).json({ ok: false, error: 'Formato de temporada inválido. Usa YYYY-MM (ej: 2026-09).' });
   }
 
-  // Migración inline para columna de temporada en world_state
-  try {
-    db.exec('ALTER TABLE world_state ADD COLUMN battlepass_season TEXT');
-  } catch (_) {}
+  // La columna battlepass_season ya la garantiza db/schema.js.
 
-  const resetBP = db.transaction(() => {
+  const resetBP = db.transaction(async () => {
     // Guardar la nueva temporada en world_state
-    db.prepare(
+    await db.prepare(
       `UPDATE world_state SET battlepass_season = ?, updated_at = datetime('now') WHERE id = 1`
     ).run(newSeasonMonth);
 
     // Resetear progreso de battle pass de todos los jugadores
-    db.prepare(`
+    await db.prepare(`
       UPDATE player_stats
       SET battlepass_xp = 0, battlepass_tier = 0, battlepass_claimed_tiers = '[]',
           battlepass_premium = 0, updated_at = datetime('now')
     `).run();
   });
-  resetBP();
+  await resetBP();
 
-  const count = db.prepare('SELECT COUNT(*) AS n FROM player_stats').get()?.n || 0;
+  const count = (await db.prepare('SELECT COUNT(*) AS n FROM player_stats').get())?.n || 0;
   logAudit(req, 'battlepass.advance-season', 'world_state:1', { newSeasonMonth, playersReset: count }).catch(console.error);
   res.json({ ok: true, newSeasonMonth, playersReset: count });
 });
 
 // POST /api/admin/battlepass/reset-xp — Solo resetea XP/tiers sin cambiar temporada
-router.post('/battlepass/reset-xp', requireRole('owner'), (req, res) => {
-  db.prepare(`
+router.post('/battlepass/reset-xp', requireRole('owner'), async (req, res) => {
+  await db.prepare(`
     UPDATE player_stats
     SET battlepass_xp = 0, battlepass_tier = 0, battlepass_claimed_tiers = '[]',
         updated_at = datetime('now')
   `).run();
 
-  const count = db.prepare('SELECT COUNT(*) AS n FROM player_stats').get()?.n || 0;
+  const count = (await db.prepare('SELECT COUNT(*) AS n FROM player_stats').get())?.n || 0;
   logAudit(req, 'battlepass.reset-xp', null, { playersReset: count }).catch(console.error);
   res.json({ ok: true, playersReset: count });
 });
@@ -1281,27 +1255,10 @@ router.post('/battlepass/reset-xp', requireRole('owner'), (req, res) => {
 // ---------------------------------------------------------------------------
 // Reportes de jugadores
 // ---------------------------------------------------------------------------
-(() => {
-  try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS player_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        reporter_id INTEGER REFERENCES licenses(id),
-        reported_id INTEGER REFERENCES licenses(id),
-        type TEXT NOT NULL DEFAULT 'behavior',
-        severity TEXT NOT NULL DEFAULT 'low',
-        description TEXT,
-        status TEXT NOT NULL DEFAULT 'open',
-        resolved_by TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-      CREATE INDEX IF NOT EXISTS idx_reports_status ON player_reports(status, created_at DESC);
-    `);
-  } catch (_) {}
-})();
+// La tabla player_reports (y su índice) ya la crea db/schema.js en el arranque.
 
 // GET /api/admin/reports?status=&type=
-router.get('/reports', (req, res) => {
+router.get('/reports', async (req, res) => {
   const { status, type } = req.query;
   const conditions = [];
   const params = [];
@@ -1310,7 +1267,7 @@ router.get('/reports', (req, res) => {
   if (type) { conditions.push('pr.type = ?'); params.push(type); }
 
   const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT pr.id, pr.type, pr.severity, pr.description, pr.status, pr.created_at,
            r.key_prefix AS reporter_key_prefix, rps.username AS reporter_username,
            t.key_prefix AS reported_key_prefix, tps.username AS reported_username
@@ -1328,7 +1285,7 @@ router.get('/reports', (req, res) => {
 });
 
 // POST /api/admin/reports/:id/action   body: { action: 'actioned'|'dismiss'|'open' }
-router.post('/reports/:id/action', (req, res) => {
+router.post('/reports/:id/action', async (req, res) => {
   const { action } = req.body || {};
   const validActions = ['actioned', 'dismiss', 'open'];
   if (!validActions.includes(action)) {
@@ -1336,7 +1293,7 @@ router.post('/reports/:id/action', (req, res) => {
   }
 
   const statusMap = { actioned: 'actioned', dismiss: 'dismissed', open: 'open' };
-  const info = db.prepare(
+  const info = await db.prepare(
     `UPDATE player_reports SET status = ?, resolved_by = ? WHERE id = ?`
   ).run(statusMap[action], req.adminUser?.username || 'admin', req.params.id);
 
@@ -1392,18 +1349,18 @@ router.get('/ban-history', async (req, res) => {
 // Analytics — métricas calculadas a partir de tablas existentes
 // No requiere tabla nueva: usa player_stats, purchases, premium_orders, anticheat_flags
 // ---------------------------------------------------------------------------
-router.get('/analytics', (req, res) => {
+router.get('/analytics', async (req, res) => {
   try {
-    const totalPlayers = db.prepare('SELECT COUNT(*) AS n FROM player_stats').get()?.n || 0;
-    const totalMatches = db.prepare('SELECT SUM(matches_played) AS n FROM player_stats').get()?.n || 0;
-    const totalPurchases = db.prepare('SELECT COUNT(*) AS n FROM purchases').get()?.n || 0;
-    const totalCoinsSpent = db.prepare('SELECT SUM(price) AS n FROM purchases').get()?.n || 0;
-    const premiumCount = db.prepare(
+    const totalPlayers = (await db.prepare('SELECT COUNT(*) AS n FROM player_stats').get())?.n || 0;
+    const totalMatches = (await db.prepare('SELECT SUM(matches_played) AS n FROM player_stats').get())?.n || 0;
+    const totalPurchases = (await db.prepare('SELECT COUNT(*) AS n FROM purchases').get())?.n || 0;
+    const totalCoinsSpent = (await db.prepare('SELECT SUM(price) AS n FROM purchases').get())?.n || 0;
+    const premiumCount = (await db.prepare(
       'SELECT COUNT(*) AS n FROM player_stats WHERE battlepass_premium = 1'
-    ).get()?.n || 0;
-    const avgCoins = db.prepare('SELECT AVG(coins) AS n FROM player_stats').get()?.n || 0;
-    const avgLevel = db.prepare('SELECT AVG(level) AS n FROM player_stats').get()?.n || 0;
-    const flagsTotal = db.prepare('SELECT COUNT(*) AS n FROM anticheat_flags').get()?.n || 0;
+    ).get())?.n || 0;
+    const avgCoins = (await db.prepare('SELECT AVG(coins) AS n FROM player_stats').get())?.n || 0;
+    const avgLevel = (await db.prepare('SELECT AVG(level) AS n FROM player_stats').get())?.n || 0;
+    const flagsTotal = (await db.prepare('SELECT COUNT(*) AS n FROM anticheat_flags').get())?.n || 0;
 
     res.json({
       ok: true,
@@ -1439,9 +1396,9 @@ router.get('/analytics', (req, res) => {
 //  separado exportado al final del módulo para que server.js lo monte en
 //  /api/game o un path accesible por el cliente.)
 const publicRouter = express.Router();
-publicRouter.get('/broadcast', (req, res) => {
+publicRouter.get('/broadcast', async (req, res) => {
   const now = new Date().toISOString();
-  const active = db.prepare(
+  const active = await db.prepare(
     `SELECT id, message, type, duration FROM broadcasts WHERE expires_at > ? ORDER BY id DESC LIMIT 1`
   ).get(now);
   res.json({ ok: true, broadcast: active || null });

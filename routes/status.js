@@ -8,12 +8,12 @@ const router = express.Router();
 // Lee maintenance_mode y banner_message de world_state para que el cliente
 // los reciba en el arranque. Si maintenance_mode es true, el cliente debe
 // mostrar la pantalla de mantenimiento y no permitir jugar online.
-router.get('/status', (req, res) => {
-  const news = db
+router.get('/status', async (req, res) => {
+  const news = await db
     .prepare('SELECT title, body, date FROM news ORDER BY id DESC LIMIT 4')
     .all();
 
-  const world = db.prepare('SELECT * FROM world_state WHERE id = 1').get();
+  const world = await db.prepare('SELECT * FROM world_state WHERE id = 1').get();
 
   res.json({
     ok: true,

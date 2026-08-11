@@ -10,8 +10,8 @@ const router = express.Router();
 // se actualizaba sola al publicar una versión nueva, así que este endpoint
 // se quedaba mostrando siempre la misma versión aunque se publicaran otras.
 // No requiere token: se debe poder consultar antes de iniciar sesión.
-router.get('/version', (req, res) => {
-  const release = db.prepare('SELECT version FROM releases ORDER BY id DESC LIMIT 1').get();
+router.get('/version', async (req, res) => {
+  const release = await db.prepare('SELECT version FROM releases ORDER BY id DESC LIMIT 1').get();
 
   res.json({
     ok: true,

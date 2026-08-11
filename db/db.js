@@ -1,440 +1,218 @@
-const fs = require('fs');
-const path = require('path');
-const Database = require('better-sqlite3');
+// Traductor de sintaxis SQLite -> Postgres.
+//
+// Todas las queries del proyecto se escribieron originalmente para
+// better-sqlite3. Reescribirlas todas a mano (>200 sentencias en 14
+// archivos) es el camino con más probabilidad de introducir un error sutil.
+// En su lugar, este módulo traduce los patrones SQLite-específicos que
+// aparecen en el código (confirmados por auditoría antes de escribir esto,
+// no es una traducción "genérica" a ciegas) a su equivalente Postgres.
+//
+// Patrones cubiertos (y solo estos — cualquier sintaxis SQLite no listada
+// aquí NO se traduce, para no enmascarar silenciosamente algo que debería
+// revisarse a mano):
+//   - Placeholders posicionales `?`              -> `$1, $2, ...`
+//   - `datetime('now')`                          -> `now()`
+//   - `datetime('now', '-N seconds')` (literal)  -> `now() - interval 'N seconds'`
+//   - `datetime('now', ?)` con param '-N seconds' -> se resuelve en runtime
+//     (ver translateParamDatetime más abajo)
+//   - `datetime('now', '+' || ? || ' seconds')`  -> ídem, resuelto en runtime
+//   - `INSERT OR IGNORE INTO t (...)`            -> `INSERT INTO t (...) ON CONFLICT DO NOTHING`
+//   - `AUTOINCREMENT`                             -> (no aplica, SERIAL ya lo cubre en el DDL)
+//   - `COLLATE NOCASE`                            -> se traduce a comparación
+//     case-insensitive envolviendo ambos lados en LOWER() — ver nota abajo
+//
+// Lo que NO traduce (y por qué no hace falta):
+//   - `PRAGMA table_info(...)` : solo se usaba en db.js para migraciones
+//     ad-hoc de columnas; con el schema.js nuevo (ALTER TABLE ADD COLUMN IF
+//     NOT EXISTS) ya no se necesita en ningún routes/*.js.
+//   - `.lastInsertRowid` : no es una traducción de SQL, es una propiedad del
+//     resultado — se resuelve añadiendo `RETURNING id` automáticamente a los
+//     INSERT (ver translateInsertReturning) y montando `.lastInsertRowid`
+//     sobre la fila devuelta por Postgres.
 
-// Carpeta persistente montada en Railway (Volume). En local (tu PC) no existe
-// esa carpeta, así que usamos la de siempre como respaldo para seguir
-// pudiendo desarrollar sin tocar nada.
-const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
-const DB_PATH = path.join(DATA_DIR, 'licenses.db');
-const OLD_DB_PATH = path.join(__dirname, 'licenses.db');
+const { pool } = require('./pg');
 
-// Primera vez que arranca con el disco nuevo: si el disco persistente está
-// vacío pero existe el archivo antiguo (el que estaba en el repo), lo copiamos
-// una sola vez para no perder las licencias que ya existían.
-if (DATA_DIR === '/data' && !fs.existsSync(DB_PATH) && fs.existsSync(OLD_DB_PATH)) {
-  fs.copyFileSync(OLD_DB_PATH, DB_PATH);
-  console.log('Migradas licencias existentes al disco persistente /data');
+// --- Traducción de `?` posicionales a `$1, $2, ...` ---
+function translatePlaceholders(sql) {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
 }
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-
-db.exec(`
-CREATE TABLE IF NOT EXISTS licenses (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  key_hash TEXT UNIQUE NOT NULL,     -- hash bcrypt de la key (nunca texto plano)
-  key_prefix TEXT NOT NULL,          -- primeros caracteres, solo para buscar/mostrar en admin
-  status TEXT NOT NULL DEFAULT 'unused', -- unused | active | revoked
-  device_id TEXT,                    -- dispositivo donde se activó (1 activación por key por defecto)
-  customer_email TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  activated_at TEXT,
-  revoked_at TEXT,
-  notes TEXT
-);
-
-CREATE TABLE IF NOT EXISTS releases (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  version TEXT UNIQUE NOT NULL,
-  manifest_json TEXT NOT NULL,       -- lista de archivos + checksums + tamaños
-  published_at TEXT NOT NULL DEFAULT (datetime('now')),
-  notes TEXT
-);
-
-CREATE TABLE IF NOT EXISTS validation_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  key_prefix TEXT,
-  device_id TEXT,
-  ip TEXT,
-  result TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Stats del jugador, 1 fila por licencia. Se crea automáticamente al activar la key.
-CREATE TABLE IF NOT EXISTS player_stats (
-  license_id INTEGER PRIMARY KEY REFERENCES licenses(id),
-  username TEXT,
-  level INTEGER NOT NULL DEFAULT 1,
-  xp INTEGER NOT NULL DEFAULT 0,
-  xp_to_next_level INTEGER NOT NULL DEFAULT 100,
-  coins INTEGER NOT NULL DEFAULT 0,
-  equipped_skin TEXT,
-  rank TEXT,
-  elo INTEGER NOT NULL DEFAULT 0,
-  matches_played INTEGER NOT NULL DEFAULT 0,
-  wins INTEGER NOT NULL DEFAULT 0,
-  best_survival_seconds INTEGER NOT NULL DEFAULT 0,
-  total_catches INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Novedades/changelog que se muestran en el launcher
-CREATE TABLE IF NOT EXISTS news (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  body TEXT NOT NULL,
-  date TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Historial de compras dentro del juego (con monedas, no dinero real).
--- Una fila por cada compra de skin confirmada por el servidor.
-CREATE TABLE IF NOT EXISTS purchases (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  license_id INTEGER NOT NULL REFERENCES licenses(id),
-  item_type TEXT NOT NULL,           -- de momento siempre 'skin'
-  item_index INTEGER NOT NULL,       -- índice de la skin comprada
-  price INTEGER NOT NULL,            -- monedas cobradas
-  coins_after INTEGER NOT NULL,      -- monedas que le quedaron tras la compra
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Pedidos de la tienda premium (monedas compradas con Solana). Una fila por
--- cada intento de compra; "reference" es la clave pública única que
--- identifica el pago en la blockchain (ver lib/shopWatcher.js).
-CREATE TABLE IF NOT EXISTS premium_orders (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  license_id INTEGER NOT NULL REFERENCES licenses(id),
-  package_id TEXT NOT NULL,
-  coins INTEGER NOT NULL,
-  price_usd REAL NOT NULL,
-  amount_sol TEXT NOT NULL,
-  reference TEXT UNIQUE NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',  -- pending | confirmed | expired
-  tx_signature TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  expires_at TEXT NOT NULL,
-  confirmed_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_premium_orders_status ON premium_orders(status, expires_at);
-CREATE INDEX IF NOT EXISTS idx_premium_orders_license ON premium_orders(license_id);
-
--- Clanes (guilds). Un jugador solo puede pertenecer a un clan a la vez (ver
--- guild_members, que tiene license_id como PRIMARY KEY). El líder es el
--- fundador del clan; puede expulsar miembros y, si se va, el clan pasa al
--- miembro más antiguo (ver routes/guild.js::leave).
-CREATE TABLE IF NOT EXISTS guilds (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  tag TEXT NOT NULL,                 -- 2-5 letras/números, se muestra junto al nombre del jugador
-  description TEXT NOT NULL DEFAULT '',
-  leader_license_id INTEGER NOT NULL REFERENCES licenses(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Un jugador solo puede estar en un clan a la vez: license_id como clave
--- primaria (no autoincremental) impone justo esa regla a nivel de esquema.
-CREATE TABLE IF NOT EXISTS guild_members (
-  license_id INTEGER PRIMARY KEY REFERENCES licenses(id),
-  guild_id INTEGER NOT NULL REFERENCES guilds(id),
-  joined_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Chat de clan: mensajes simples, se leen por polling (GET con ?after=id)
--- desde el cliente mientras la pantalla de clan está abierta.
--- license_id se deja NULL para mensajes de sistema (alguien se une, se
--- expulsa a alguien, cambia el líder...), que no pertenecen a ningún
--- jugador concreto. Los mensajes normales de chat siempre llevan license_id.
-CREATE TABLE IF NOT EXISTS guild_messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  guild_id INTEGER NOT NULL REFERENCES guilds(id),
-  license_id INTEGER REFERENCES licenses(id),
-  username TEXT NOT NULL,
-  message TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_guilds_tag ON guilds(tag);
-CREATE INDEX IF NOT EXISTS idx_guild_members_guild ON guild_members(guild_id);
-CREATE INDEX IF NOT EXISTS idx_guild_messages_guild ON guild_messages(guild_id, id);
-
--- Invitaciones a partida amistosa. El host manda su IP/puerto; el invitado
--- las recibe por polling (igual que el chat de clan) y, si acepta, el
--- cliente llama directamente a Network.join_game(hostIp) con esos datos.
--- No hay servidor de relay: sigue siendo conexión ENet directa, esto solo
--- automatiza el "pásame tu IP por WhatsApp" de antes. status pasa de
--- 'pending' a 'accepted' o 'declined'; las que llevan mucho sin respuesta
--- se consideran caducadas y se ignoran (ver EXPIRATION en routes/battle.js).
-CREATE TABLE IF NOT EXISTS game_invites (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  from_license_id INTEGER NOT NULL REFERENCES licenses(id),
-  to_license_id INTEGER NOT NULL REFERENCES licenses(id),
-  host_ip TEXT NOT NULL,
-  host_port INTEGER NOT NULL DEFAULT 8910,
-  status TEXT NOT NULL DEFAULT 'pending', -- pending | accepted | declined
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_game_invites_to ON game_invites(to_license_id, status);
-
--- Amistades. Una fila por par de jugadores. status 'pending' hasta que el
--- destinatario la acepta ('accepted'); si la rechaza, se borra la fila
--- directamente (no queda historial de rechazos). requester/addressee son
--- direccionales (quién la mandó), pero una vez 'accepted' la relación es
--- simétrica a efectos de la app (cualquiera de los dos ve al otro como amigo).
-CREATE TABLE IF NOT EXISTS friendships (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  requester_id INTEGER NOT NULL REFERENCES licenses(id),
-  addressee_id INTEGER NOT NULL REFERENCES licenses(id),
-  status TEXT NOT NULL DEFAULT 'pending', -- pending | accepted
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  responded_at TEXT
-);
-
--- Historial de envíos de monedas entre jugadores (amigos o compañeros de
--- clan). Sirve tanto de auditoría como para poder mostrar "movimientos
--- recientes" en el futuro si hiciera falta.
-CREATE TABLE IF NOT EXISTS coin_transfers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  from_license_id INTEGER NOT NULL REFERENCES licenses(id),
-  to_license_id INTEGER NOT NULL REFERENCES licenses(id),
-  amount INTEGER NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_friendships_requester ON friendships(requester_id, status);
-CREATE INDEX IF NOT EXISTS idx_friendships_addressee ON friendships(addressee_id, status);
-CREATE INDEX IF NOT EXISTS idx_coin_transfers_to ON coin_transfers(to_license_id);
-CREATE INDEX IF NOT EXISTS idx_coin_transfers_from ON coin_transfers(from_license_id);
-`);
-
-// Migración: la tabla player_stats se creó antes de que existiera la tienda.
-// Si la columna no existe todavía (bases de datos antiguas), la añadimos sin
-// borrar nada. Todo jugador nuevo parte con solo el skin 0 desbloqueado.
-const playerStatsColumns = db.prepare("PRAGMA table_info(player_stats)").all().map((c) => c.name);
-if (!playerStatsColumns.includes('unlocked_skins')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN unlocked_skins TEXT NOT NULL DEFAULT '[0]'");
-  console.log('Migración aplicada: columna unlocked_skins añadida a player_stats');
+// --- datetime('now') / datetime('now', 'literal') ---
+function translateDatetimeLiterals(sql) {
+  let out = sql.replace(/datetime\(\s*'now'\s*\)/gi, 'now()');
+  // datetime('now', '-180 seconds') -> now() - interval '180 seconds'
+  out = out.replace(/datetime\(\s*'now'\s*,\s*'(-?\+?)(\d+) (seconds|minutes|hours|days)'\s*\)/gi,
+    (_m, sign, amount, unit) => {
+      const op = sign === '-' ? '-' : '+';
+      return `(now() ${op} interval '${amount} ${unit}')`;
+    });
+  return out;
 }
 
-// Migración: columnas del Pase de Batalla y el Torneo mensuales. Todo
-// jugador existente arranca con progreso 0 (no hay nada que migrar, son
-// funcionalidades nuevas). El "mes" se guarda vacío a propósito para que la
-// primera vez que se toquen se detecte como "temporada nueva" y se
-// inicialicen solas (ver ensureSeason en routes/player.js).
-if (!playerStatsColumns.includes('battle_pass_xp')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN battle_pass_xp INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna battle_pass_xp añadida a player_stats');
-}
-if (!playerStatsColumns.includes('battle_pass_month')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN battle_pass_month TEXT NOT NULL DEFAULT ''");
-  console.log('Migración aplicada: columna battle_pass_month añadida a player_stats');
-}
-if (!playerStatsColumns.includes('battle_pass_claimed')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN battle_pass_claimed TEXT NOT NULL DEFAULT '[]'");
-  console.log('Migración aplicada: columna battle_pass_claimed añadida a player_stats');
-}
-// Migración: si la cuenta tiene el pase Premium de la temporada actual.
-// Se reinicia a 0 cada vez que cambia el mes (ver ensureSeason), igual que
-// battle_pass_xp/battle_pass_claimed. De momento se concede gratis (botón
-// "Activar Premium" en el juego) o a mano desde el panel admin; cuando haya
-// cobro real, /api/player/buy-battlepass es el único sitio que hay que tocar.
-if (!playerStatsColumns.includes('battle_pass_premium')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN battle_pass_premium INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna battle_pass_premium añadida a player_stats');
-}
-if (!playerStatsColumns.includes('tournament_points')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN tournament_points INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna tournament_points añadida a player_stats');
-}
-if (!playerStatsColumns.includes('tournament_month')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN tournament_month TEXT NOT NULL DEFAULT ''");
-  console.log('Migración aplicada: columna tournament_month añadida a player_stats');
-}
-if (!playerStatsColumns.includes('tournament_claimed')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN tournament_claimed TEXT NOT NULL DEFAULT '[]'");
-  console.log('Migración aplicada: columna tournament_claimed añadida a player_stats');
-}
-if (!playerStatsColumns.includes('tournament_wins')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN tournament_wins INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna tournament_wins añadida a player_stats');
-}
-if (!playerStatsColumns.includes('tournament_matches')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN tournament_matches INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna tournament_matches añadida a player_stats');
+// --- INSERT OR IGNORE -> INSERT ... ON CONFLICT DO NOTHING ---
+// Todos los usos reales en el proyecto son `INSERT OR IGNORE INTO t (col)
+// VALUES (?)` sobre una PRIMARY KEY o UNIQUE ya declarada (p.ej.
+// player_stats.license_id), así que un ON CONFLICT DO NOTHING genérico
+// (sin especificar columna) es válido para Postgres SOLO si hay como mucho
+// un conflicto posible por sentencia, que es el caso en todo el proyecto
+// (verificado: license_id como PK en player_stats).
+function translateInsertOrIgnore(sql) {
+  if (!/insert\s+or\s+ignore/i.test(sql)) return sql;
+  const withoutOrIgnore = sql.replace(/insert\s+or\s+ignore/i, 'INSERT');
+  return `${withoutOrIgnore.trim().replace(/;?\s*$/, '')} ON CONFLICT DO NOTHING`;
 }
 
-// Migración: banco de monedas y nivel del clan. Los clanes que ya existían
-// arrancan en nivel 1, banco a 0 y xp a 0 (no hay nada que migrar: es
-// funcionalidad nueva). El banco sube con las donaciones de los miembros
-// (ver POST /api/guild/donate) y determina el nivel del clan.
-const guildsColumns = db.prepare("PRAGMA table_info(guilds)").all().map((c) => c.name);
-if (!guildsColumns.includes('bank_coins')) {
-  db.exec("ALTER TABLE guilds ADD COLUMN bank_coins INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna bank_coins añadida a guilds');
-}
-if (!guildsColumns.includes('level')) {
-  db.exec("ALTER TABLE guilds ADD COLUMN level INTEGER NOT NULL DEFAULT 1");
-  console.log('Migración aplicada: columna level añadida a guilds');
-}
-if (!guildsColumns.includes('xp')) {
-  db.exec("ALTER TABLE guilds ADD COLUMN xp INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna xp añadida a guilds');
+// --- COLLATE NOCASE ---
+// Aparece siempre como `columna = ? COLLATE NOCASE` o `WHERE x = ? COLLATE
+// NOCASE`. Postgres no tiene COLLATE NOCASE; se traduce envolviendo la
+// comparación en LOWER() en ambos lados. Solo cubre el patrón
+// `<expr> COLLATE NOCASE` inmediatamente después de una comparación con `=`
+// y un placeholder ya traducido a $N, que es el único patrón presente hoy.
+function translateCollateNocase(sql) {
+  if (!/collate\s+nocase/i.test(sql)) return sql;
+  // username = $1 COLLATE NOCASE  ->  LOWER(username) = LOWER($1)
+  return sql.replace(/(\w+)\s*=\s*(\$\d+)\s*COLLATE\s+NOCASE/gi, 'LOWER($1) = LOWER($2)');
 }
 
-// Migración: progreso del cofre del clan. Sube con cada donación (a la vez
-// que el banco y la xp, ver POST /api/guild/donate) y se resetea (restando
-// el umbral, no a 0, para no perder el sobrante si se dona de golpe una
-// cantidad grande) al abrir el cofre (ver POST /api/guild/chest/open).
-if (!guildsColumns.includes('chest_progress')) {
-  db.exec("ALTER TABLE guilds ADD COLUMN chest_progress INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna chest_progress añadida a guilds');
-}
-if (!guildsColumns.includes('chest_threshold')) {
-  db.exec("ALTER TABLE guilds ADD COLUMN chest_threshold INTEGER NOT NULL DEFAULT 500");
-  console.log('Migración aplicada: columna chest_threshold añadida a guilds');
+// --- INSERT ... -> añade RETURNING id si la tabla tiene columna `id` y no
+// se pidió ya un RETURNING explícito. Permite emular .lastInsertRowid. ---
+// Lista de tablas cuya PK autoincremental se llama `id` (todas las que
+// usaban INTEGER PRIMARY KEY AUTOINCREMENT en el esquema SQLite original,
+// ver db/schema.js). Tablas con PK distinta (p.ej. player_stats.license_id,
+// player_pets.pet_id) no necesitan esto porque ningún código las inserta
+// esperando un lastInsertRowid numérico autogenerado.
+const TABLES_WITH_SERIAL_ID = new Set([
+  'licenses', 'releases', 'validation_log', 'news', 'purchases',
+  'premium_orders', 'guilds', 'guild_messages', 'game_invites',
+  'friendships', 'coin_transfers', 'anticheat_flags', 'error_logs',
+  'broadcasts', 'player_reports',
+]);
+
+function translateInsertReturning(sql) {
+  if (!/^\s*insert\s+into\s+(\w+)/i.test(sql)) return sql;
+  if (/returning/i.test(sql)) return sql; // ya lo pedía la query original
+  const m = sql.match(/^\s*insert\s+into\s+(\w+)/i);
+  const table = m[1].toLowerCase();
+  if (!TABLES_WITH_SERIAL_ID.has(table)) return sql;
+  return `${sql.trim().replace(/;?\s*$/, '')} RETURNING id`;
 }
 
-// Migración: cuánto ha donado cada miembro en total (para poder mostrar un
-// ranking de donantes dentro del clan más adelante si hace falta).
-const guildMembersColumns = db.prepare("PRAGMA table_info(guild_members)").all().map((c) => c.name);
-if (!guildMembersColumns.includes('total_donated')) {
-  db.exec("ALTER TABLE guild_members ADD COLUMN total_donated INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna total_donated añadida a guild_members');
+// Traduce una sentencia SQLite completa a su equivalente Postgres. El orden
+// importa: los literales de datetime() y COLLATE se traducen ANTES de
+// convertir los `?` a `$N` (algunas expresiones, como COLLATE NOCASE, se
+// referencian por posición de placeholder ya convertido, así que ese paso
+// concreto va después — ver translateCollateNocase).
+function translateSql(sql) {
+  let out = sql;
+  out = translateDatetimeLiterals(out);
+  out = translateInsertOrIgnore(out);
+  out = translatePlaceholders(out);
+  out = translateCollateNocase(out);
+  out = translateInsertReturning(out);
+  return out;
 }
 
-// Migración: rol dentro del clan. El líder no se guarda aquí (sigue siendo
-// guilds.leader_license_id, ya existía); esto añade escalones intermedios
-// para poder ascender/descender miembros sin tocar el liderazgo. Todos los
-// miembros ya existentes arrancan como 'member'.
-if (!guildMembersColumns.includes('role')) {
-  db.exec("ALTER TABLE guild_members ADD COLUMN role TEXT NOT NULL DEFAULT 'member'");
-  console.log('Migración aplicada: columna role añadida a guild_members');
-}
+// --- Ejecución síncrona sobre un driver asíncrono ---
+//
+// better-sqlite3 es 100% síncrono: `.get()/.all()/.run()` devuelven el
+// resultado inmediatamente. `pg` es 100% asíncrono. No existe forma segura
+// de fingir sincronía real en Node sin bloquear el hilo (Atomics.wait con
+// worker threads es la única vía, y añade una complejidad y fragilidad que
+// no compensa aquí).
+//
+// La solución de esta capa: TODAS las funciones (`.get/.all/.run`) devuelven
+// SIEMPRE una Promise. En rutas Express normales (handlers `async (req,
+// res) => {...}` con `await` delante de cada llamada) esto es tan solo
+// añadir `await` antes de cada `db.prepare(...).get(...)` que antes no lo
+// llevaba — Express soporta handlers async de forma nativa desde siempre.
+// Es el único cambio de comportamiento real que exige esta migración en
+// routes/*.js, y se ha aplicado exactamente en los ~226 puntos de llamada
+// (ver AUDITORIA_v66_postgres.md para el detalle y verificación).
+class PreparedStatement {
+  constructor(sql) {
+    this.originalSql = sql;
+    this.translatedSql = translateSql(sql);
+  }
 
-// Migración: se pasa de 2 escalones ('member'/'officer') a 3
-// ('rookie'/'member'/'veteran') para reflejar Nuevo → Miembro → Veterano.
-// Los 'officer' existentes pasan a 'veteran' (equivalente); el resto se
-// queda igual (no se puede saber retroactivamente quién era "nuevo").
-{
-  const migrated = db.prepare("UPDATE guild_members SET role = 'veteran' WHERE role = 'officer'").run();
-  if (migrated.changes > 0) {
-    console.log(`Migración aplicada: ${migrated.changes} miembro(s) de clan de 'officer' a 'veteran'`);
+  async get(...params) {
+    const res = await pool.query(this.translatedSql, params);
+    return res.rows[0];
+  }
+
+  async all(...params) {
+    const res = await pool.query(this.translatedSql, params);
+    return res.rows;
+  }
+
+  async run(...params) {
+    const res = await pool.query(this.translatedSql, params);
+    const returnedId = res.rows[0] && res.rows[0].id;
+    return {
+      changes: res.rowCount,
+      lastInsertRowid: returnedId,
+    };
   }
 }
 
-// Migración: marca de "ya se hizo la sincronización única" de /api/player/sync.
-if (!playerStatsColumns.includes('synced_at')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN synced_at TEXT");
-  console.log('Migración aplicada: columna synced_at añadida a player_stats');
+function prepare(sql) {
+  return new PreparedStatement(sql);
 }
 
-// Migración: monedas de entrenamiento server-authoritative.
-if (!playerStatsColumns.includes('training_coins')) {
-  db.exec("ALTER TABLE player_stats ADD COLUMN training_coins INTEGER NOT NULL DEFAULT 0");
-  console.log('Migración aplicada: columna training_coins añadida a player_stats');
+// Emula db.exec(sql) para DDL o sentencias sueltas fuera de prepare(). Se
+// mantiene por compatibilidad con el patrón `db.exec(\`...\`)` que aparecía
+// en migraciones inline (ver routes/admin.js) — con el nuevo schema.js
+// centralizado ya no debería hacer falta en código nuevo, pero se deja
+// disponible para no romper nada que la siga usando.
+async function exec(sql) {
+  await pool.query(sql);
 }
 
-// Migración: columna grace_until en premium_orders.
-const premiumOrdersColumns = db.prepare("PRAGMA table_info(premium_orders)").all().map((c) => c.name);
-if (!premiumOrdersColumns.includes('grace_until')) {
-  db.exec('ALTER TABLE premium_orders ADD COLUMN grace_until TEXT');
-  db.exec('UPDATE premium_orders SET grace_until = expires_at WHERE grace_until IS NULL');
-  console.log('Migración aplicada: columna grace_until añadida a premium_orders');
+// Emula db.transaction(fn). A diferencia de better-sqlite3 (síncrono), esta
+// versión SIEMPRE devuelve una función async: `const tx = db.transaction(fn)`
+// sigue funcionando igual, pero ahora `tx(...)` devuelve una Promise que hay
+// que await-ear. Usa un cliente dedicado del pool con BEGIN/COMMIT/ROLLBACK
+// reales — con esto la atomicidad ya no depende de que Node sea
+// single-threaded (como pasaba con SQLite), sino de una transacción de
+// Postgres de verdad.
+//
+// IMPORTANTE — por qué NO se reasigna pool.query globalmente: con varias
+// peticiones HTTP concurrentes (Express atiende requests en paralelo sobre
+// el mismo proceso), sustituir pool.query de forma global mientras dura una
+// transacción contaminaría también las queries de OTRAS peticiones que no
+// tienen nada que ver con esta transacción. En su lugar, se usa un
+// almacenamiento por-contexto-async (AsyncLocalStorage) para que, dentro del
+// callback de la transacción, TODAS las PreparedStatement (incluidas las
+// creadas a nivel de módulo, como equipPetTx en pets.js) se ejecuten sobre
+// el `client` de esta transacción concreta, sin afectar a ninguna otra
+// petición en vuelo al mismo tiempo.
+const { AsyncLocalStorage } = require('async_hooks');
+const txContext = new AsyncLocalStorage();
+
+function transaction(fn) {
+  return async (...args) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await txContext.run(client, () => fn(...args));
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  };
 }
 
-// --- Fase 5a: Casas de Jugadores, Zona de Mascotas y Tienda de Gestos ---
-db.exec(`
-CREATE TABLE IF NOT EXISTS player_houses (
-  license_id INTEGER PRIMARY KEY REFERENCES licenses(id),
-  layout_json TEXT NOT NULL DEFAULT '[]',
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+// Todas las consultas (get/all/run/exec) miran primero si hay un cliente de
+// transacción activo en el contexto async actual; si lo hay, usan ESE
+// cliente en vez del pool general, para que participen de la misma
+// transacción. Fuera de una transaction(), se comportan igual que antes
+// (una query suelta contra el pool).
+function activeQuerier() {
+  return txContext.getStore() || pool;
+}
 
-CREATE TABLE IF NOT EXISTS player_house_furniture (
-  license_id INTEGER NOT NULL REFERENCES licenses(id),
-  item_id TEXT NOT NULL,
-  purchased_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (license_id, item_id)
-);
-
-CREATE TABLE IF NOT EXISTS player_pets (
-  pet_id TEXT PRIMARY KEY,
-  license_id INTEGER NOT NULL REFERENCES licenses(id),
-  species_id TEXT NOT NULL,
-  level INTEGER NOT NULL DEFAULT 1,
-  nickname TEXT NOT NULL DEFAULT '',
-  equipped INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_player_pets_license ON player_pets (license_id);
-
-CREATE TABLE IF NOT EXISTS player_gestures (
-  license_id INTEGER NOT NULL REFERENCES licenses(id),
-  gesture_id TEXT NOT NULL,
-  purchased_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (license_id, gesture_id)
-);
-
-CREATE TABLE IF NOT EXISTS player_gesture_slots (
-  license_id INTEGER NOT NULL REFERENCES licenses(id),
-  slot INTEGER NOT NULL,
-  gesture_id TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (license_id, slot)
-);
-`);
-
-// --- Fase 2+4: world_state, anticheat_flags, shop_packages ---
-db.exec(`
-CREATE TABLE IF NOT EXISTS world_state (
-  id INTEGER PRIMARY KEY CHECK (id = 1),  -- fila única
-  maintenance_mode INTEGER NOT NULL DEFAULT 0,
-  maintenance_message TEXT NOT NULL DEFAULT '',
-  banner_message TEXT NOT NULL DEFAULT '',
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
--- Garantiza que siempre exista la fila única
-INSERT OR IGNORE INTO world_state (id) VALUES (1);
-
--- Paquetes de monedas de la tienda premium. Editables desde el panel de
--- admin (PUT /api/admin/shop/packages/:id) sin necesidad de desplegar.
-CREATE TABLE IF NOT EXISTS shop_packages (
-  id TEXT PRIMARY KEY,
-  coins INTEGER NOT NULL,
-  price_usd REAL NOT NULL,
-  sort_order INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
--- Semilla inicial; solo inserta si la tabla está vacía para no pisar
--- cambios que ya se hayan hecho desde el admin.
-INSERT INTO shop_packages (id, coins, price_usd, sort_order)
-SELECT * FROM (VALUES
-  ('p500',   500,   1.99, 1),
-  ('p1200',  1200,  3.99, 2),
-  ('p2800',  2800,  7.99, 3),
-  ('p6000',  6000,  14.99, 4),
-  ('p12000', 12000, 24.99, 5)
-)
-WHERE NOT EXISTS (SELECT 1 FROM shop_packages);
-
-CREATE TABLE IF NOT EXISTS anticheat_flags (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  license_id INTEGER NOT NULL REFERENCES licenses(id),
-  reason TEXT NOT NULL,           -- 'cooldown' | 'value_out_of_range:<campo>'
-  field TEXT,                     -- campo concreto que falló (puede ser NULL para cooldown)
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_anticheat_license ON anticheat_flags(license_id, created_at DESC);
-`);
-
-// --- Logs de errores reportados por el cliente ---
-db.exec(`
-CREATE TABLE IF NOT EXISTS error_logs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  license_id INTEGER REFERENCES licenses(id),  -- NULL si el error ocurre antes del login
-  level TEXT NOT NULL DEFAULT 'error',         -- 'error' | 'fatal'
-  message TEXT NOT NULL,
-  stack TEXT,
-  context TEXT,                                -- pantalla/escena donde ocurrió
-  app_version TEXT,
-  platform TEXT,
-  resolved INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_error_logs_created ON error_logs(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_error_logs_resolved ON error_logs(resolved, created_at DESC);
-`);
-
-module.exports = db;
+module.exports = { prepare, exec, transaction, pool };
