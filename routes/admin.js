@@ -193,32 +193,34 @@ router.get('/purchases', async (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/admin/online
 // ---------------------------------------------------------------------------
-router.get('/online', (req, res) => {
+router.get('/online', async (req, res) => {
   const windowSeconds = parseInt(req.query.windowSeconds, 10) || 300;
   const online = listOnline(windowSeconds * 1000);
 
-  const players = online.map(async ({ deviceId, lastSeenSecondsAgo }) => {
-    const license = await db
-      .prepare('SELECT id, key_prefix, customer_email, status FROM licenses WHERE device_id = ?')
-      .get(deviceId);
-    const stats = license
-      ? await db
-          .prepare('SELECT username, level, elo, rank FROM player_stats WHERE license_id = ?')
-          .get(license.id)
-      : null;
+  const players = await Promise.all(
+    online.map(async ({ deviceId, lastSeenSecondsAgo }) => {
+      const license = await db
+        .prepare('SELECT id, key_prefix, customer_email, status FROM licenses WHERE device_id = ?')
+        .get(deviceId);
+      const stats = license
+        ? await db
+            .prepare('SELECT username, level, elo, rank FROM player_stats WHERE license_id = ?')
+            .get(license.id)
+        : null;
 
-    return {
-      deviceId,
-      lastSeenSecondsAgo,
-      keyPrefix: license ? license.key_prefix : null,
-      customerEmail: license ? license.customer_email : null,
-      licenseStatus: license ? license.status : null,
-      username: stats ? stats.username : null,
-      level: stats ? stats.level : null,
-      elo: stats ? stats.elo : null,
-      rank: stats ? stats.rank : null,
-    };
-  });
+      return {
+        deviceId,
+        lastSeenSecondsAgo,
+        keyPrefix: license ? license.key_prefix : null,
+        customerEmail: license ? license.customer_email : null,
+        licenseStatus: license ? license.status : null,
+        username: stats ? stats.username : null,
+        level: stats ? stats.level : null,
+        elo: stats ? stats.elo : null,
+        rank: stats ? stats.rank : null,
+      };
+    })
+  );
 
   res.json({ ok: true, count: players.length, windowSeconds, players });
 });

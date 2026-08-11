@@ -31,6 +31,16 @@
 //     sobre la fila devuelta por Postgres.
 
 const { pool } = require('./pg');
+const { AsyncLocalStorage } = require('async_hooks');
+
+// Almacenamiento de contexto por transacción async. Cuando una query se
+// ejecuta dentro de db.transaction(), este store contiene el client dedicado;
+// fuera de transacción, getStore() devuelve undefined y se usa el pool normal.
+const txContext = new AsyncLocalStorage();
+
+function activeQuerier() {
+  return txContext.getStore() || pool;
+}
 
 // --- Traducción de `?` posicionales a `$1, $2, ...` ---
 function translatePlaceholders(sql) {
@@ -136,17 +146,17 @@ class PreparedStatement {
   }
 
   async get(...params) {
-    const res = await pool.query(this.translatedSql, params);
+    const res = await activeQuerier().query(this.translatedSql, params);
     return res.rows[0];
   }
 
   async all(...params) {
-    const res = await pool.query(this.translatedSql, params);
+    const res = await activeQuerier().query(this.translatedSql, params);
     return res.rows;
   }
 
   async run(...params) {
-    const res = await pool.query(this.translatedSql, params);
+    const res = await activeQuerier().query(this.translatedSql, params);
     const returnedId = res.rows[0] && res.rows[0].id;
     return {
       changes: res.rowCount,
@@ -165,7 +175,7 @@ function prepare(sql) {
 // centralizado ya no debería hacer falta en código nuevo, pero se deja
 // disponible para no romper nada que la siga usando.
 async function exec(sql) {
-  await pool.query(sql);
+  await activeQuerier().query(sql);
 }
 
 // Emula db.transaction(fn). A diferencia de better-sqlite3 (síncrono), esta
@@ -186,9 +196,6 @@ async function exec(sql) {
 // creadas a nivel de módulo, como equipPetTx en pets.js) se ejecuten sobre
 // el `client` de esta transacción concreta, sin afectar a ninguna otra
 // petición en vuelo al mismo tiempo.
-const { AsyncLocalStorage } = require('async_hooks');
-const txContext = new AsyncLocalStorage();
-
 function transaction(fn) {
   return async (...args) => {
     const client = await pool.connect();
@@ -204,15 +211,6 @@ function transaction(fn) {
       client.release();
     }
   };
-}
-
-// Todas las consultas (get/all/run/exec) miran primero si hay un cliente de
-// transacción activo en el contexto async actual; si lo hay, usan ESE
-// cliente en vez del pool general, para que participen de la misma
-// transacción. Fuera de una transaction(), se comportan igual que antes
-// (una query suelta contra el pool).
-function activeQuerier() {
-  return txContext.getStore() || pool;
 }
 
 module.exports = { prepare, exec, transaction, pool };
