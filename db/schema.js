@@ -425,7 +425,6 @@ async function ensureSchema(pool) {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_status ON player_reports(status, created_at DESC);`);
-}
 
   // --- Fase C: Matchmaking y salas públicas ---
 
@@ -467,6 +466,6 @@ async function ensureSchema(pool) {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_mmrm_license ON mm_room_members(license_id);`);
-
+}
 
 module.exports = { ensureSchema };
