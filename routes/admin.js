@@ -624,7 +624,7 @@ router.get('/anticheat', async (req, res) => {
      FROM anticheat_flags af
      JOIN licenses l ON l.id = af.license_id
      LEFT JOIN player_stats ps ON ps.license_id = af.license_id
-     GROUP BY af.license_id
+     GROUP BY af.license_id, l.key_prefix, ps.username
      ORDER BY flagCount DESC
      LIMIT 10`
   ).all();
