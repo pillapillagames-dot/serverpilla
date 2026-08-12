@@ -184,11 +184,11 @@ router.get('/room/:id', requireToken, async (req, res) => {
 // El host la usa cuando quiere hostear una partida y compartir el roomId
 // manualmente (p.ej. pegándolo en un chat externo) o antes de invitar.
 // ---------------------------------------------------------------------------
-router.post('/create', requireToken, asyncHandler(async (req, res) => {
+router.post('/create', requireToken, async (req, res) => {
   const mode = (req.body?.mode || 'normal').toString().trim();
   const roomId = createRoom();
   res.json({ ok: true, roomId });
-}));
+});
 
 // ---------------------------------------------------------------------------
 // GET /api/battle/rooms  — número de salas activas (solo para admin panel)
