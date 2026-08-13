@@ -242,6 +242,56 @@ router.post('/nickname', requireToken, async (req, res) => {
   res.json({ ok: true, username: nickname });
 });
 
+// POST /api/player/rename  body: { newName }  (requiere token)
+// Cambia el nombre del jugador descontando RENAME_COST monedas del servidor.
+// Usa la misma validación que /nickname. Si el nombre es igual al actual,
+// no cobra. Devuelve { ok, username, coins } para que el cliente actualice
+// ambos valores de golpe.
+const RENAME_COST = 300; // monedas que cuesta un cambio de nombre
+
+router.post('/rename', requireToken, async (req, res) => {
+  const newName = (req.body?.newName || req.body?.nickname || '').trim();
+
+  if (!NICKNAME_REGEX.test(newName)) {
+    return res.status(400).json({
+      ok: false,
+      error: 'El nombre debe tener 3-16 caracteres: letras, números o "_".',
+    });
+  }
+
+  await db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = await db.prepare('SELECT username, coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+
+  // Si el nombre es el mismo que ya tiene, no cobra ni hace nada.
+  if (stats.username && stats.username.toLowerCase() === newName.toLowerCase()) {
+    return res.json({ ok: true, username: stats.username, coins: stats.coins });
+  }
+
+  // Comprueba que no lo esté usando ya otro jugador.
+  const taken = await db
+    .prepare('SELECT license_id FROM player_stats WHERE lower(username) = lower(?) AND license_id != ?')
+    .get(newName, req.license.id);
+
+  if (taken) {
+    return res.status(409).json({ ok: false, error: 'Ese nombre ya está en uso.' });
+  }
+
+  if (stats.coins < RENAME_COST) {
+    return res.status(400).json({
+      ok: false,
+      error: `Necesitas ${RENAME_COST} monedas para cambiar de nombre. Tienes ${stats.coins}.`,
+    });
+  }
+
+  const newCoins = stats.coins - RENAME_COST;
+
+  await db.prepare(
+    `UPDATE player_stats SET username = ?, coins = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(newName, newCoins, req.license.id);
+
+  res.json({ ok: true, username: newName, coins: newCoins });
+});
+
 // POST /api/player/match-result  (requiere token)
 // body: {
 //   coinsEarned: number,       // monedas ganadas en ESTA partida
