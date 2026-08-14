@@ -438,7 +438,14 @@ async function ensureSchema(pool) {
       queued_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mmq_mode_elo ON matchmaking_queue(mode, elo);`);
+  // Columna size añadida en Fase C.2 (soporte Dúo/Trío/Escuadra)
+  // ALTER idempotente: no rompe si la columna ya existe.
+  await pool.query(`ALTER TABLE matchmaking_queue ADD COLUMN IF NOT EXISTS size INTEGER NOT NULL DEFAULT 2;`);
+
+  // Índice compuesto por (mode, size, elo) para que el tick del matchmaker
+  // filtre eficientemente por sub-cola antes de ordenar por elo.
+  await pool.query(`DROP INDEX IF EXISTS idx_mmq_mode_elo;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_mmq_mode_size_elo ON matchmaking_queue(mode, size, elo);`);
 
   // Salas activas (creadas por matchmaking o manualmente)
   await pool.query(`
